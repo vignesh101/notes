@@ -5,31 +5,36 @@ import math
 from dotenv import load_dotenv
 from openai import OpenAI
 import httpx
+from moviepy.editor import VideoFileClip
+import whisper  # pip install openai-whisper
 
 # Load .env variables
 load_dotenv()
 
 base_url = os.getenv("openai_base_url")
 api_key = os.getenv("openai_api_key")
-model_name = os.getenv("openai_model_name", "pixtral-12b-2409")  # or mistral-small-latest
+model_name = os.getenv("openai_model_name", "pixtral-12b-2409")  # Vision-capable model
 proxy_url = os.getenv("proxy_url")
 disable_ssl = os.getenv("disable_ssl", "False").lower() == "true"
 
-# Setup client with proxy and optional SSL disable
+# Setup client
 client_kwargs = {"api_key": api_key, "base_url": base_url}
 
 if proxy_url or disable_ssl:
     http_client = httpx.Client(
         proxy=proxy_url if proxy_url else None,
-        verify=False if disable_ssl else True  # WARNING: verify=False is insecure
+        verify=False if disable_ssl else True
     )
     client_kwargs["http_client"] = http_client
 
 client = OpenAI(**client_kwargs)
 
+# Load Whisper model once (use "base" for speed, "large-v3" for max accuracy)
+whisper_model = whisper.load_model("base")  # Options: tiny, base, small, medium, large-v3
+
 
 def extract_frames_from_video(video_path, num_frames=8):
-    """Extract evenly spaced frames from video and return as base64 data URLs"""
+    """Extract evenly spaced frames → base64 data URLs"""
     vidcap = cv2.VideoCapture(video_path)
     if not vidcap.isOpened():
         raise ValueError("Could not open video file.")
@@ -42,9 +47,8 @@ def extract_frames_from_video(video_path, num_frames=8):
     success, image = vidcap.read()
     frame_idx = 0
 
-    # Target timestamps for even sampling
     if duration > 0 and num_frames > 0:
-        intervals = [i * duration / (num_frames + 1) for i in range(1, num_frames + 1)]  # Adjusted for better spacing
+        intervals = [i * duration / (num_frames + 1) for i in range(1, num_frames + 1)]
     else:
         intervals = []
 
@@ -69,18 +73,41 @@ def extract_frames_from_video(video_path, num_frames=8):
     return frames
 
 
-def analyze_video(video_path,
-                  prompt="Describe what is happening in this video in detail, step by step.",
-                  seconds_per_frame=4.0,
-                  max_frames_per_request=8):
+def transcribe_audio(video_path):
+    """Extract audio from video and transcribe with Whisper"""
+    print("Extracting and transcribing audio...")
+    
+    # Extract audio temporarily
+    video_clip = VideoFileClip(video_path)
+    audio_path = "temp_audio.wav"
+    video_clip.audio.write_audiofile(audio_path, verbose=False, logger=None)
+    video_clip.close()
+    
+    # Transcribe
+    result = whisper_model.transcribe(audio_path, fp16=False)  # fp16=False for CPU compatibility
+    transcript = result["text"].strip()
+    
+    # Optional: Get segments with timestamps
+    segments = "\n".join([f"[{seg['start']:.1f}s → {seg['end']:.1f}s] {seg['text'].strip()}" 
+                          for seg in result["segments"]])
+    
+    # Clean up temp file
+    os.remove(audio_path)
+    
+    return transcript, segments
+
+
+def analyze_video_with_audio(video_path,
+                             visual_prompt="Describe the key events, actions, people, objects, and scene changes in chronological order.",
+                             seconds_per_frame=4.0,
+                             max_frames_per_request=8):
     """
-    Fully automatic video analysis:
-    - Calculates appropriate sampling rate
-    - Extracts all frames upfront
-    - Splits and sends in chunks if needed
-    - Returns clean final summary (no technical details shown)
+    Full video + audio analysis:
+    - Visual: Sampled frames (chunked if needed)
+    - Audio: Full transcript with timestamps
+    - Final combined detailed report
     """
-    # Get video duration
+    # 1. Get video duration
     vidcap = cv2.VideoCapture(video_path)
     fps = vidcap.get(cv2.CAP_PROP_FPS)
     total_video_frames = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -90,32 +117,30 @@ def analyze_video(video_path,
     if duration_seconds == 0:
         raise ValueError("Could not read video duration.")
 
-    # Decide how many frames to sample (1 every ~seconds_per_frame)
-    desired_frames = max(4, int(duration_seconds / seconds_per_frame))  # at least 4
-    total_sampled_frames = min(desired_frames, max_frames_per_request * 4)  # cap at 32 for cost/reasonableness
+    # 2. Calculate frames to sample
+    desired_frames = max(4, int(duration_seconds / seconds_per_frame))
+    total_sampled_frames = min(desired_frames, max_frames_per_request * 4)  # Cap at 32
 
-    # Extract ALL frames upfront
-    print("Extracting frames...")
+    # 3. Extract all visual frames upfront
+    print("Extracting visual frames...")
     all_frames_base64 = extract_frames_from_video(video_path, num_frames=total_sampled_frames)
 
-    # Calculate chunks
+    # 4. Transcribe audio
+    full_transcript, timed_transcript = transcribe_audio(video_path)
+
+    # 5. Visual analysis in chunks
     chunks = math.ceil(total_sampled_frames / max_frames_per_request)
+    visual_descriptions = []
 
-    all_part_descriptions = []
-
-    print("Analyzing video...")
-
+    print("Analyzing visuals...")
     for chunk_idx in range(chunks):
         start = chunk_idx * max_frames_per_request
         end = min(start + max_frames_per_request, total_sampled_frames)
         chunk_frames = all_frames_base64[start:end]
 
-        content = [{"type": "text", "text": prompt}]
+        content = [{"type": "text", "text": visual_prompt}]
         for frame in chunk_frames:
-            content.append({
-                "type": "image_url",
-                "image_url": {"url": frame}
-            })
+            content.append({"type": "image_url", "image_url": {"url": frame}})
 
         messages = [{"role": "user", "content": content}]
 
@@ -125,42 +150,50 @@ def analyze_video(video_path,
             max_tokens=1024,
             temperature=0.7,
         )
+        visual_descriptions.append(response.choices[0].message.content.strip())
 
-        description = response.choices[0].message.content.strip()
-        all_part_descriptions.append(description)
+    # 6. Combine everything into final detailed report
+    print("Generating combined audio + video summary report...")
 
-    # Combine all parts into one final coherent summary
-    if len(all_part_descriptions) == 1:
-        final_summary = all_part_descriptions[0]
-    else:
-        combine_prompt = (
-            "The following are descriptions of different segments of the same video:\n\n" +
-            "\n\n---\n\n".join(all_part_descriptions) +
-            "\n\nCombine these into one clear, chronological, and detailed summary of the entire video."
-        )
+    combine_prompt = f"""
+You are analyzing a video that combines visual content and spoken audio.
 
-        final_response = client.chat.completions.create(
-            model=model_name,
-            messages=[{"role": "user", "content": combine_prompt}],
-            max_tokens=1024,
-            temperature=0.5,
-        )
-        final_summary = final_response.choices[0].message.content.strip()
+Visual descriptions (from sampled frames):
+{"\n\n---\n\n".join(visual_descriptions)}
 
-    return final_summary
+Full spoken transcript (with approximate timestamps):
+{timed_transcript}
+
+Provide a detailed, chronological summary report of the entire video, integrating:
+- What is seen (actions, people, objects, scenes, text on screen)
+- What is said (dialogue, narration)
+- Key events and their timing
+- Overall context and meaning
+
+Make it clear, structured, and comprehensive.
+"""
+
+    final_response = client.chat.completions.create(
+        model=model_name,
+        messages=[{"role": "user", "content": combine_prompt}],
+        max_tokens=2048,
+        temperature=0.5,
+    )
+
+    return final_response.choices[0].message.content.strip()
 
 
 # ================ RUN EXAMPLE ================
 if __name__ == "__main__":
-    video_file = "C:/Users/h75378/Downloads/sample_1.mp4"  # Change to your video path
+    video_file = "C:/Users/h75378/Downloads/sample_1.mp4"  # Update path
 
-    result = analyze_video(
+    report = analyze_video_with_audio(
         video_file,
-        prompt="Describe the key events, actions, people, objects, and scene changes in chronological order.",
-        seconds_per_frame=4.0  # Adjust: lower = more detail (and cost), higher = faster
+        visual_prompt="Describe the key events, actions, people, objects, and scene changes in chronological order.",
+        seconds_per_frame=4.0  # Lower = more visual detail
     )
 
-    print("\n" + "="*60)
-    print("VIDEO ANALYSIS")
-    print("="*60)
-    print(result)
+    print("\n" + "="*80)
+    print("DETAILED VIDEO + AUDIO SUMMARY REPORT")
+    print("="*80)
+    print(report)
