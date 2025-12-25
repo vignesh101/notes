@@ -1,110 +1,71 @@
-import os
-import cv2
-import base64
-from dotenv import load_dotenv
-from openai import OpenAI
-
-# Load environment variables from .env
-load_dotenv()
-
-# Configuration from .env
-base_url = os.getenv("openai_base_url")  # e.g., "https://api.mistral.ai/v1"
-api_key = os.getenv("openai_api_key")
-model_name = os.getenv("openai_model_name", "mistral-small-latest")  # Use mistral-small-latest or similar vision model
-proxy_url = os.getenv("proxy_url")
-disable_ssl = os.getenv("disable_ssl", "False").lower() == "true"
-
-# Setup OpenAI client compatible with Mistral API
-client_kwargs = {
-    "api_key": api_key,
-    "base_url": base_url,
-}
-
-if proxy_url:
-    client_kwargs["http_client"] = openai.ProxyClient(proxy=proxy_url)
-
-# Note: OpenAI SDK does not have a direct disable_ssl_verify option.
-# If needed, use custom requests session with verify=False (insecure, not recommended):
-if disable_ssl:
-    import requests
-    session = requests.Session()
-    session.verify = False
-    from openai import httpx
-    client_kwargs["http_client"] = httpx.Client(proxy=proxy_url if proxy_url else None, transport=httpx.HTTPTransport(session=session))
-
-client = OpenAI(**client_kwargs)
-
-def extract_frames_from_video(video_path, num_frames=10, interval_seconds=5):
+def analyze_video_chunked(video_path, prompt="Describe what is happening in this video in detail.", max_frames_per_request=8, total_frames=24):
     """
-    Extract key frames from a video using OpenCV.
-    Samples frames at regular intervals (default every 5 seconds, up to 10 frames).
+    Extract more frames (e.g., 24) and send them in chunks of 8 to the model.
+    Then combine all responses.
     """
-    vidcap = cv2.VideoCapture(video_path)
-    if not vidcap.isOpened():
-        raise ValueError("Could not open video file.")
+    import math
+    
+    # Calculate how many chunks we need
+    chunks = math.ceil(total_frames / max_frames_per_request)
+    all_analyses = []
 
-    fps = vidcap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
-    duration = total_frames / fps if fps > 0 else 0
+    print(f"Extracting {total_frames} frames in {chunks} chunk(s) of up to {max_frames_per_request}...")
 
-    frames = []
-    frame_count = 0
-    success, image = vidcap.read()
+    for chunk_idx in range(chunks):
+        start_frame = chunk_idx * max_frames_per_request
+        end_frame = min((chunk_idx + 1) * max_frames_per_request, total_frames)
+        num_in_chunk = end_frame - start_frame
+        
+        print(f"Processing chunk {chunk_idx + 1}/{chunks}: frames {start_frame+1}–{end_frame}")
 
-    target_intervals = [i * (duration / num_frames) for i in range(1, num_frames)]
-    next_target = 0
+        # Extract only this chunk's worth of evenly spaced frames
+        frames_base64 = extract_frames_from_video(video_path, num_frames=num_in_chunk)
+        
+        # Adjust spacing to cover the full video evenly across all chunks
+        # (Alternatively, you could sample different sections per chunk)
 
-    while success:
-        current_time = frame_count / fps if fps > 0 else 0
-        if next_target < len(target_intervals) and current_time >= target_intervals[next_target]:
-            # Convert BGR to RGB (optional, but JPEG is fine as-is)
-            _, buffer = cv2.imencode(".jpg", image)
-            base64_image = base64.b64encode(buffer).decode("utf-8")
-            frames.append(f"data:image/jpeg;base64,{base64_image}")
-            next_target += 1
-        if next_target >= len(target_intervals):
-            break
-        success, image = vidcap.read()
-        frame_count += 1
+        content = [{"type": "text", "text": f"{prompt} (Part {chunk_idx + 1}/{chunks})"}]
+        for frame in frames_base64:
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": frame}
+            })
 
-    vidcap.release()
-    if not frames:
-        raise ValueError("No frames extracted from video.")
-    return frames
+        messages = [{"role": "user", "content": content}]
 
-def analyze_video(video_path, prompt="Describe what is happening in this video in detail.", num_frames=10):
-    """
-    Analyze a video by extracting frames and sending them to the Mistral vision model.
-    """
-    print(f"Extracting {num_frames} frames from {video_path}...")
-    frames_base64 = extract_frames_from_video(video_path, num_frames=num_frames)
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=messages,
+            max_tokens=1024,
+            temperature=0.7,
+        )
 
-    # Build content with text prompt + multiple images
-    content = [{"type": "text", "text": prompt}]
-    for frame in frames_base64:
-        content.append({
-            "type": "image_url",
-            "image_url": {"url": frame}
-        })
+        part_analysis = response.choices[0].message.content
+        all_analyses.append(part_analysis)
+        print(f"Chunk {chunk_idx + 1} complete.\n")
 
-    messages = [
-        {"role": "user", "content": content}
-    ]
-
-    print("Sending request to Mistral vision model...")
-    response = client.chat.completions.create(
-        model=model_name,
-        messages=messages,
-        max_tokens=1024,
-        temperature=0.7,
+    # Optional: Final summary combining all parts
+    final_prompt = "Combine these partial video descriptions into one coherent summary of the entire video:\n\n" + "\n\n".join(
+        [f"Part {i+1}: {text}" for i, text in enumerate(all_analyses)]
     )
 
-    analysis = response.choices[0].message.content
-    return analysis
+    final_response = client.chat.completions.create(
+        model=model_name,
+        messages=[{"role": "user", "content": final_prompt}],
+        max_tokens=1024,
+    )
 
-# Example usage
+    full_summary = final_response.choices[0].message.content
+    return "\n\n".join(all_analyses) + "\n\n--- FINAL SUMMARY ---\n" + full_summary
+
+
 if __name__ == "__main__":
-    video_file = "path/to/your/video.mp4"  # Replace with your video path
-    result = analyze_video(video_file, prompt="Summarize the key events and actions in this video step by step.")
-    print("\nVideo Analysis:\n")
+    video_file = "C:/Users/h75378/Downloads/sample_1.mp4"
+    result = analyze_video_chunked(
+        video_file,
+        prompt="Describe the actions, people, and events shown step by step.",
+        max_frames_per_request=8,
+        total_frames=24  # e.g., 3 chunks of 8 frames → better coverage
+    )
+    print("\nFull Video Analysis (Chunked):\n")
     print(result)
