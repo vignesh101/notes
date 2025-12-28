@@ -1,199 +1,305 @@
-import os
-import cv2
-import base64
-import math
-from dotenv import load_dotenv
-from openai import OpenAI
-import httpx
-from moviepy.editor import VideoFileClip
-import whisper  # pip install openai-whisper
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Solar System Hand Control</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #050505; }
+        video { display: none; }
+        #info {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: white;
+            font-family: 'Courier New', Courier, monospace;
+            pointer-events: none;
+            background: rgba(0,0,0,0.6);
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #333;
+        }
+        #current-planet {
+            color: #4db8ff;
+            font-weight: bold;
+            font-size: 1.2em;
+        }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+</head>
+<body>
 
-# Load .env variables
-load_dotenv()
+    <div id="info">
+        <h3>🌌 Solar System Controller</h3>
+        <p>Current: <span id="current-planet">Sun</span></p>
+        <hr style="border-color: #333;">
+        <p>🖐 <b>Open Hand:</b> Move Object</p>
+        <p>🤏 <b>Pinch:</b> Resize / Pulse</p>
+        <p>✊ <b>Make Fist:</b> Next Planet</p>
+    </div>
+    <video id="input_video"></video>
 
-base_url = os.getenv("openai_base_url")
-api_key = os.getenv("openai_api_key")
-model_name = os.getenv("openai_model_name", "pixtral-12b-2409")  # Vision-capable model
-proxy_url = os.getenv("proxy_url")
-disable_ssl = os.getenv("disable_ssl", "False").lower() == "true"
-
-# Setup client
-client_kwargs = {"api_key": api_key, "base_url": base_url}
-
-if proxy_url or disable_ssl:
-    http_client = httpx.Client(
-        proxy=proxy_url if proxy_url else None,
-        verify=False if disable_ssl else True
-    )
-    client_kwargs["http_client"] = http_client
-
-client = OpenAI(**client_kwargs)
-
-# Load Whisper model once (use "base" for speed, "large-v3" for max accuracy)
-whisper_model = whisper.load_model("base")  # Options: tiny, base, small, medium, large-v3
-
-
-def extract_frames_from_video(video_path, num_frames=8):
-    """Extract evenly spaced frames → base64 data URLs"""
-    vidcap = cv2.VideoCapture(video_path)
-    if not vidcap.isOpened():
-        raise ValueError("Could not open video file.")
-
-    fps = vidcap.get(cv2.CAP_PROP_FPS)
-    total_frames_count = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
-    duration = total_frames_count / fps if fps > 0 else 0
-
-    frames = []
-    success, image = vidcap.read()
-    frame_idx = 0
-
-    if duration > 0 and num_frames > 0:
-        intervals = [i * duration / (num_frames + 1) for i in range(1, num_frames + 1)]
-    else:
-        intervals = []
-
-    next_interval_idx = 0
-
-    while success:
-        current_time = frame_idx / fps if fps > 0 else 0
-
-        if next_interval_idx < len(intervals) and current_time >= intervals[next_interval_idx]:
-            _, buffer = cv2.imencode(".jpg", image)
-            base64_img = base64.b64encode(buffer).decode("utf-8")
-            frames.append(f"data:image/jpeg;base64,{base64_img}")
-            next_interval_idx += 1
-
-        if len(frames) >= num_frames:
-            break
-
-        success, image = vidcap.read()
-        frame_idx += 1
-
-    vidcap.release()
-    return frames
-
-
-def transcribe_audio(video_path):
-    """Extract audio from video and transcribe with Whisper"""
-    print("Extracting and transcribing audio...")
+<script>
+    // --- CONFIGURATION ---
+    const PARTICLE_COUNT = 4000; // Increased for better planet density
+    const PARTICLE_SIZE = 0.12;
     
-    # Extract audio temporarily
-    video_clip = VideoFileClip(video_path)
-    audio_path = "temp_audio.wav"
-    video_clip.audio.write_audiofile(audio_path, verbose=False, logger=None)
-    video_clip.close()
-    
-    # Transcribe
-    result = whisper_model.transcribe(audio_path, fp16=False)  # fp16=False for CPU compatibility
-    transcript = result["text"].strip()
-    
-    # Optional: Get segments with timestamps
-    segments = "\n".join([f"[{seg['start']:.1f}s → {seg['end']:.1f}s] {seg['text'].strip()}" 
-                          for seg in result["segments"]])
-    
-    # Clean up temp file
-    os.remove(audio_path)
-    
-    return transcript, segments
+    // --- THREE.JS SETUP ---
+    const scene = new THREE.Scene();
+    // Add subtle fog for depth
+    scene.fog = new THREE.FogExp2(0x000000, 0.02);
 
+    const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.z = 35;
 
-def analyze_video_with_audio(video_path,
-                             visual_prompt="Describe the key events, actions, people, objects, and scene changes in chronological order.",
-                             seconds_per_frame=4.0,
-                             max_frames_per_request=8):
-    """
-    Full video + audio analysis:
-    - Visual: Sampled frames (chunked if needed)
-    - Audio: Full transcript with timestamps
-    - Final combined detailed report
-    """
-    # 1. Get video duration
-    vidcap = cv2.VideoCapture(video_path)
-    fps = vidcap.get(cv2.CAP_PROP_FPS)
-    total_video_frames = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
-    duration_seconds = total_video_frames / fps if fps > 0 else 0
-    vidcap.release()
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(window.devicePixelRatio);
+    document.body.appendChild(renderer.domElement);
 
-    if duration_seconds == 0:
-        raise ValueError("Could not read video duration.")
+    // --- PARTICLES SETUP ---
+    const geometry = new THREE.BufferGeometry();
+    const positions = new Float32Array(PARTICLE_COUNT * 3);
+    const colors = new Float32Array(PARTICLE_COUNT * 3);
+    const targetPositions = new Float32Array(PARTICLE_COUNT * 3);
+    const targetColors = new Float32Array(PARTICLE_COUNT * 3);
 
-    # 2. Calculate frames to sample
-    desired_frames = max(4, int(duration_seconds / seconds_per_frame))
-    total_sampled_frames = min(desired_frames, max_frames_per_request * 4)  # Cap at 32
+    // Initial fill
+    for (let i = 0; i < PARTICLE_COUNT * 3; i++) {
+        positions[i] = (Math.random() - 0.5) * 100;
+        targetPositions[i] = positions[i];
+        colors[i] = 1;
+        targetColors[i] = 1;
+    }
 
-    # 3. Extract all visual frames upfront
-    print("Extracting visual frames...")
-    all_frames_base64 = extract_frames_from_video(video_path, num_frames=total_sampled_frames)
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
 
-    # 4. Transcribe audio
-    full_transcript, timed_transcript = transcribe_audio(video_path)
+    const material = new THREE.PointsMaterial({
+        size: PARTICLE_SIZE,
+        vertexColors: true,
+        blending: THREE.AdditiveBlending,
+        transparent: true,
+        opacity: 0.9,
+        sizeAttenuation: true
+    });
 
-    # 5. Visual analysis in chunks
-    chunks = math.ceil(total_sampled_frames / max_frames_per_request)
-    visual_descriptions = []
+    const particleSystem = new THREE.Points(geometry, material);
+    scene.add(particleSystem);
 
-    print("Analyzing visuals...")
-    for chunk_idx in range(chunks):
-        start = chunk_idx * max_frames_per_request
-        end = min(start + max_frames_per_request, total_sampled_frames)
-        chunk_frames = all_frames_base64[start:end]
+    // --- SOLAR SYSTEM DATA ---
+    // Defines geometry types and colors for every celestial body
+    const SolarSystem = [
+        { name: "Sun",      radius: 12, type: 'star',   color: [1.0, 0.6, 0.1] }, // Orange/Yellow
+        { name: "Mercury",  radius: 2,  type: 'sphere', color: [0.7, 0.7, 0.7] }, // Grey
+        { name: "Venus",    radius: 3.5,type: 'sphere', color: [0.9, 0.8, 0.6] }, // Pale Yellow
+        { name: "Earth",    radius: 3.8,type: 'earth',  color: [0.2, 0.4, 1.0] }, // Blue/Green
+        { name: "Mars",     radius: 2.5,type: 'sphere', color: [1.0, 0.2, 0.1] }, // Red
+        { name: "Jupiter",  radius: 10, type: 'banded', color: [0.8, 0.6, 0.4] }, // Beige/Orange Bands
+        { name: "Saturn",   radius: 8,  type: 'saturn', color: [0.9, 0.8, 0.5] }, // Gold + Rings
+        { name: "Uranus",   radius: 6,  type: 'sphere', color: [0.4, 0.9, 0.9] }, // Cyan
+        { name: "Neptune",  radius: 6,  type: 'sphere', color: [0.1, 0.2, 0.8] }, // Deep Blue
+    ];
 
-        content = [{"type": "text", "text": visual_prompt}]
-        for frame in chunk_frames:
-            content.append({"type": "image_url", "image_url": {"url": frame}})
+    let currentIndex = 0;
 
-        messages = [{"role": "user", "content": content}]
+    // --- GEOMETRY GENERATORS ---
+    function getSpherePoint(r) {
+        // Random point inside sphere (volumetric) or on surface
+        const theta = Math.random() * Math.PI * 2;
+        const phi = Math.acos(2 * Math.random() - 1);
+        // Distribute 80% on surface, 20% inside for volume
+        const dist = Math.random() > 0.8 ? r * Math.cbrt(Math.random()) : r; 
+        return {
+            x: dist * Math.sin(phi) * Math.cos(theta),
+            y: dist * Math.sin(phi) * Math.sin(theta),
+            z: dist * Math.cos(phi)
+        };
+    }
 
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=messages,
-            max_tokens=1024,
-            temperature=0.7,
-        )
-        visual_descriptions.append(response.choices[0].message.content.strip())
+    function setSolarShape(planetIndex) {
+        const body = SolarSystem[planetIndex];
+        document.getElementById('current-planet').innerText = body.name;
+        
+        const r = body.radius;
+        const baseColor = body.color;
 
-    # 6. Combine everything into final detailed report
-    print("Generating combined audio + video summary report...")
+        for (let i = 0; i < PARTICLE_COUNT; i++) {
+            let x, y, z, cr, cg, cb;
+            
+            // --- POSITION LOGIC ---
+            if (body.type === 'saturn') {
+                // 70% Planet, 30% Rings
+                if (i < PARTICLE_COUNT * 0.7) {
+                    const p = getSpherePoint(r);
+                    x = p.x; y = p.y; z = p.z;
+                } else {
+                    // Rings
+                    const angle = Math.random() * Math.PI * 2;
+                    const ringDist = r * 1.4 + Math.random() * (r * 1.5);
+                    x = ringDist * Math.cos(angle);
+                    z = ringDist * Math.sin(angle); // Tilt handled by rotation later
+                    y = (Math.random() - 0.5) * 0.5; // Thin disc
+                }
+            } else if (body.type === 'star') {
+                // Sun: Volumetric with corona spikes
+                const p = getSpherePoint(r);
+                const spike = Math.random() > 0.95 ? 1.5 : 1.0; // Coronal ejections
+                x = p.x * spike; y = p.y * spike; z = p.z * spike;
+            } else {
+                // Standard Sphere (Earth, Mars, etc)
+                const p = getSpherePoint(r);
+                x = p.x; y = p.y; z = p.z;
+            }
 
-    combine_prompt = f"""
-You are analyzing a video that combines visual content and spoken audio.
+            // --- COLOR LOGIC ---
+            if (body.type === 'earth') {
+                // Simple noise approximation for Earth continents vs ocean
+                const noise = Math.sin(x*0.5) * Math.cos(y*0.5);
+                if (noise > 0.3) { // Land (Greenish)
+                    cr = 0.2; cg = 0.8; cb = 0.3;
+                } else { // Ocean (Blue)
+                    cr = 0.1; cg = 0.3; cb = 0.9;
+                }
+                // Add polar caps
+                if (Math.abs(y) > r * 0.85) { cr=1; cg=1; cb=1; } 
+            } else if (body.type === 'banded') {
+                // Jupiter stripes based on Y height
+                const bands = Math.sin(y * 1.5);
+                cr = baseColor[0] + bands * 0.1;
+                cg = baseColor[1] + bands * 0.05;
+                cb = baseColor[2];
+            } else {
+                // Solid color with slight variation
+                const variation = (Math.random() - 0.5) * 0.2;
+                cr = baseColor[0] + variation;
+                cg = baseColor[1] + variation;
+                cb = baseColor[2] + variation;
+            }
 
-Visual descriptions (from sampled frames):
-{"\n\n---\n\n".join(visual_descriptions)}
+            // Set Targets
+            const idx = i * 3;
+            targetPositions[idx] = x;
+            targetPositions[idx+1] = y;
+            targetPositions[idx+2] = z;
 
-Full spoken transcript (with approximate timestamps):
-{timed_transcript}
+            targetColors[idx] = Math.max(0, Math.min(1, cr));
+            targetColors[idx+1] = Math.max(0, Math.min(1, cg));
+            targetColors[idx+2] = Math.max(0, Math.min(1, cb));
+        }
+    }
 
-Provide a detailed, chronological summary report of the entire video, integrating:
-- What is seen (actions, people, objects, scenes, text on screen)
-- What is said (dialogue, narration)
-- Key events and their timing
-- Overall context and meaning
+    // Initialize with Sun
+    setSolarShape(0);
 
-Make it clear, structured, and comprehensive.
-"""
+    // --- INTERACTION STATE ---
+    let handX = 0, handY = 0;
+    let expansionFactor = 1;
+    let isFistDetected = false;
+    let lastFistTime = 0;
 
-    final_response = client.chat.completions.create(
-        model=model_name,
-        messages=[{"role": "user", "content": combine_prompt}],
-        max_tokens=2048,
-        temperature=0.5,
-    )
+    // --- MEDIAPIPE ---
+    const videoElement = document.getElementById('input_video');
+    const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
 
-    return final_response.choices[0].message.content.strip()
+    hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.6, minTrackingConfidence: 0.6 });
 
+    hands.onResults(results => {
+        if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+            const lm = results.multiHandLandmarks[0];
+            
+            // 1. Position
+            const x = (1 - lm[9].x) * 2 - 1; // Middle finger knuckle for stability
+            const y = (1 - lm[9].y) * 2 - 1;
+            handX += (x * 25 - handX) * 0.1; // Smooth dampening
+            handY += (y * 25 - handY) * 0.1;
 
-# ================ RUN EXAMPLE ================
-if __name__ == "__main__":
-    video_file = "C:/Users/h75378/Downloads/sample_1.mp4"  # Update path
+            // 2. Pinch (Expansion)
+            const d = Math.sqrt(Math.pow(lm[8].x - lm[4].x, 2) + Math.pow(lm[8].y - lm[4].y, 2));
+            const targetExp = Math.max(0.2, Math.min(d * 5, 2.5));
+            expansionFactor += (targetExp - expansionFactor) * 0.1;
 
-    report = analyze_video_with_audio(
-        video_file,
-        visual_prompt="Describe the key events, actions, people, objects, and scene changes in chronological order.",
-        seconds_per_frame=4.0  # Lower = more visual detail
-    )
+            // 3. Fist Gesture (Switch Planet)
+            // Check if fingertips are below knuckles
+            const isFist = lm[8].y > lm[5].y && lm[12].y > lm[9].y && lm[16].y > lm[13].y;
+            
+            const now = Date.now();
+            if (isFist && !isFistDetected && (now - lastFistTime > 1200)) {
+                currentIndex = (currentIndex + 1) % SolarSystem.length;
+                setSolarShape(currentIndex);
+                lastFistTime = now;
+            }
+            isFistDetected = isFist;
+        }
+    });
 
-    print("\n" + "="*80)
-    print("DETAILED VIDEO + AUDIO SUMMARY REPORT")
-    print("="*80)
-    print(report)
+    const cameraUtils = new Camera(videoElement, {
+        onFrame: async () => await hands.send({image: videoElement}),
+        width: 640, height: 480
+    });
+    cameraUtils.start();
+
+    // --- ANIMATION LOOP ---
+    function animate() {
+        requestAnimationFrame(animate);
+
+        const posAttr = geometry.attributes.position;
+        const colAttr = geometry.attributes.color;
+
+        // Move system to hand
+        particleSystem.position.x = handX;
+        particleSystem.position.y = handY;
+
+        // Rotation logic
+        particleSystem.rotation.y += 0.002;
+        // Tilt Saturn/Uranus specific logic could go here, but global rotation works well enough for particles
+
+        for (let i = 0; i < PARTICLE_COUNT; i++) {
+            const idx = i * 3;
+
+            // Lerp Color
+            colAttr.array[idx]   += (targetColors[idx]   - colAttr.array[idx])   * 0.05;
+            colAttr.array[idx+1] += (targetColors[idx+1] - colAttr.array[idx+1]) * 0.05;
+            colAttr.array[idx+2] += (targetColors[idx+2] - colAttr.array[idx+2]) * 0.05;
+
+            // Lerp Position
+            let tx = targetPositions[idx];
+            let ty = targetPositions[idx+1];
+            let tz = targetPositions[idx+2];
+
+            // Apply Hand Pinch (Expansion)
+            tx *= expansionFactor;
+            ty *= expansionFactor;
+            tz *= expansionFactor;
+
+            // Jitter for 'gas' effect on Sun or Gas Giants
+            if (SolarSystem[currentIndex].type === 'star') {
+                tx += (Math.random()-0.5) * 0.2;
+                ty += (Math.random()-0.5) * 0.2;
+                tz += (Math.random()-0.5) * 0.2;
+            }
+
+            posAttr.array[idx]   += (tx - posAttr.array[idx])   * 0.1;
+            posAttr.array[idx+1] += (ty - posAttr.array[idx+1]) * 0.1;
+            posAttr.array[idx+2] += (tz - posAttr.array[idx+2]) * 0.1;
+        }
+
+        posAttr.needsUpdate = true;
+        colAttr.needsUpdate = true;
+
+        renderer.render(scene, camera);
+    }
+
+    animate();
+    window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+</script>
+</body>
+</html>
