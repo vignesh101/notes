@@ -1,85 +1,228 @@
-### Welcome to Java Programming!
+from openai import OpenAI
+from datetime import datetime
+import json
+from bs4 import BeautifulSoup
+import requests
+import urllib3
 
-Java is one of the most popular, versatile, and enduring programming languages. It's object-oriented, platform-independent (thanks to the Java Virtual Machine or JVM), and widely used for building everything from Android apps and enterprise software to web servers and big data tools.
+# Disable SSL warnings if SSL verification is disabled
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-Here's the iconic Java logo to get you started:<grok:render card_id="69c165" card_type="image_card" type="render_searched_image">
-<argument name="image_id">0</argument>
-<argument name="size">"LARGE"</argument>
-</grok:render><grok:render card_id="8b74ed" card_type="image_card" type="render_searched_image">
-<argument name="image_id">1</argument>
-<argument name="size">"LARGE"</argument>
-</grok:render>
-
-#### Step 1: Setting Up Your Environment
-To start coding in Java:
-1. Download the latest **Java Development Kit (JDK)** from the official Oracle site or use OpenJDK (free and open-source). As of 2026, aim for JDK 21 or later for modern features.
-2. Install an **Integrated Development Environment (IDE)** for easier coding:
-   - **IntelliJ IDEA** (Community Edition is free) – Highly recommended for beginners and pros.
-   - **Eclipse** – Free and powerful.
-   - **VS Code** with Java extensions – Lightweight option.
-
-Here's what a typical Java IDE looks like (IntelliJ/Eclipse screenshots):<grok:render card_id="e9366c" card_type="image_card" type="render_searched_image">
-<argument name="image_id">6</argument>
-<argument name="size">"LARGE"</argument>
-</grok:render><grok:render card_id="2c5b2b" card_type="image_card" type="render_searched_image">
-<argument name="image_id">7</argument>
-<argument name="size">"LARGE"</argument>
-</grok:render>
-
-#### Step 2: Your First Java Program – "Hello World"
-Every Java journey starts here. Create a file named `HelloWorld.java`:
-
-```java
-public class HelloWorld {
-    public static void main(String[] args) {
-        System.out.println("Hello, World!");
-    }
+# Configuration
+CONFIG = {
+    "base_url": "https://api.openai.com/v1",  # Change to your OpenAI-compatible endpoint
+    "api_key": "your-api-key-here",
+    "model_name": "gpt-4o",  # or gpt-4, gpt-3.5-turbo, etc.
+    "disable_ssl": False,  # Set to True to disable SSL verification
+    "proxy_url": None,  # e.g., "http://proxy.company.com:8080"
 }
-```
 
-- Compile it: `javac HelloWorld.java`
-- Run it: `java HelloWorld`
+# Initialize OpenAI client
+client = OpenAI(
+    base_url=CONFIG["base_url"],
+    api_key=CONFIG["api_key"],
+    http_client=None if not CONFIG["proxy_url"] else __import__('httpx').Client(
+        proxies=CONFIG["proxy_url"],
+        verify=not CONFIG["disable_ssl"]
+    )
+)
 
-Output: `Hello, World!`
 
-Visual examples of the classic Hello World in action:<grok:render card_id="0e77b4" card_type="image_card" type="render_searched_image">
-<argument name="image_id">3</argument>
-<argument name="size">"LARGE"</argument>
-</grok:render><grok:render card_id="7ad590" card_type="image_card" type="render_searched_image">
-<argument name="image_id">4</argument>
-<argument name="size">"LARGE"</argument>
-</grok:render><grok:render card_id="85997b" card_type="image_card" type="render_searched_image">
-<argument name="image_id">5</argument>
-<argument name="size">"LARGE"</argument>
-</grok:render>
+def call_tool(name, **kwargs):
+    if name == "get_time":
+        return {"time": datetime.now().isoformat()}
 
-#### Key Concepts to Learn Next
-- Variables and Data Types (int, String, etc.)
-- Control Structures (if-else, loops)
-- Object-Oriented Programming (classes, objects, inheritance, polymorphism)
-- Arrays and Collections
-- Exception Handling
-- Basic I/O
+    elif name == "web_search":
+        query = kwargs.get("query", "")
+        return perform_web_search(query)
 
-#### Recommended Free Tutorials (Updated for 2026)
-Here are some of the best resources for beginners:
+    return {"result": None}
 
-1. **Official Oracle Resources**:
-   - Dev.java (modern getting-started guides): https://dev.java/learn/
-   - Classic Java Tutorials (still useful for basics, though based on older JDK): https://docs.oracle.com/javase/tutorial/
 
-2. **W3Schools Java Tutorial** – Simple, interactive, with exercises: https://www.w3schools.com/java/
+def format_response_with_citations(message, search_results):
+    """Format the response to show text with actual source URLs"""
+    if not message or not message.content:
+        return "No response generated."
 
-3. **GeeksforGeeks Java** – Comprehensive with examples and practice problems: https://www.geeksforgeeks.org/java/
+    full_text = message.content
 
-4. **TutorialsPoint Java** – Step-by-step with code snippets: https://www.tutorialspoint.com/java/index.htm
+    # OpenAI doesn't have native citation chunking like Mistral
+    # We'll append sources at the end if available
+    if search_results:
+        full_text += "\n\n" + "=" * 60
+        full_text += "\nSources:\n"
+        
+        for idx, source in enumerate(search_results, 1):
+            full_text += f"\n[{idx}] {source['title']}\n"
+            full_text += f"    🔗 {source['link']}\n"
+            if source.get('snippet'):
+                full_text += f"    {source['snippet'][:100]}...\n"
 
-5. **Codecademy Learn Java** – Interactive course: https://www.codecademy.com/learn/learn-java
+    return full_text
 
-6. **YouTube Channels**:
-   - Bro Code (full beginner playlist)
-   - freeCodeCamp or Programming with Mosh for structured videos
 
-Practice on sites like LeetCode, HackerRank, or CodingBat for Java exercises.
+def perform_web_search(query):
+    """Perform a web search using DuckDuckGo"""
+    try:
+        # Using DuckDuckGo HTML search (no API key needed)
+        url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
 
-If you're completely new to programming, start with the basics and code daily. Java's syntax is straightforward, and you'll be building real apps in no time. What specific part of Java would you like to dive into next (e.g., OOP, setup help, or a mini-project)?
+        # Handle proxy and SSL settings for web search
+        proxies = {"http": CONFIG["proxy_url"], "https": CONFIG["proxy_url"]} if CONFIG["proxy_url"] else None
+        verify_ssl = not CONFIG["disable_ssl"]
+
+        response = requests.get(
+            url, 
+            headers=headers, 
+            timeout=10,
+            proxies=proxies,
+            verify=verify_ssl
+        )
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        results = []
+        for result in soup.find_all('div', class_='result')[:5]:  # Get top 5 results
+            title_tag = result.find('a', class_='result__a')
+            snippet_tag = result.find('a', class_='result__snippet')
+
+            if title_tag:
+                title = title_tag.get_text(strip=True)
+                link = title_tag.get('href', '')
+                snippet = snippet_tag.get_text(strip=True) if snippet_tag else ""
+
+                results.append({
+                    "title": title,
+                    "link": link,
+                    "snippet": snippet
+                })
+
+        return {
+            "query": query,
+            "results": results,
+            "count": len(results)
+        }
+
+    except Exception as e:
+        return {
+            "error": f"Search failed: {str(e)}",
+            "query": query
+        }
+
+
+def run_agent(prompt):
+    messages = [{"role": "user", "content": prompt}]
+    search_results_cache = []  # Store search results for citation mapping
+
+    # Define available tools (OpenAI function calling format)
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_time",
+                "description": "Returns the current time in ISO format",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Search the web for current information, news, facts, or any topic. Use this when you need up-to-date information or don't know the answer.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "The search query to look up on the web"
+                        }
+                    },
+                    "required": ["query"]
+                }
+            }
+        }
+    ]
+
+    while True:
+        response = client.chat.completions.create(
+            model=CONFIG["model_name"],
+            messages=messages,
+            tools=tools,
+            tool_choice="auto"
+        )
+
+        message = response.choices[0].message
+
+        # Check if model wants to call a function
+        if message.tool_calls:
+            # Add assistant's message with tool calls to history
+            messages.append({
+                "role": "assistant",
+                "content": message.content,
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": tc.type,
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments
+                        }
+                    }
+                    for tc in message.tool_calls
+                ]
+            })
+
+            # Process each tool call
+            for tool_call in message.tool_calls:
+                function_name = tool_call.function.name
+                function_args_str = tool_call.function.arguments
+
+                # Parse JSON string to dictionary
+                function_args = json.loads(function_args_str) if function_args_str else {}
+
+                # Execute the function
+                print(f"\nCalling tool: {function_name}")
+                print(f"Arguments: {function_args}")
+
+                result = call_tool(function_name, **function_args)
+
+                # Cache search results for citation mapping
+                if function_name == "web_search" and "results" in result:
+                    search_results_cache = result["results"]
+                    print(f"Found {len(search_results_cache)} results\n")
+
+                # Add function response to messages
+                messages.append({
+                    "role": "tool",
+                    "name": function_name,
+                    "content": json.dumps(result),
+                    "tool_call_id": tool_call.id
+                })
+        else:
+            # Return the formatted text response with actual source URLs
+            return format_response_with_citations(message, search_results_cache)
+
+
+# Test examples
+if __name__ == "__main__":
+    # Test time query
+    print("=" * 60)
+    print("Query: What time is it?")
+    print("=" * 60)
+    print(run_agent("What time is it?"))
+
+    print("\n" + "=" * 60)
+    print("Query: What's the latest news about AI?")
+    print("=" * 60)
+    print(run_agent("What's the latest news about AI?"))
+
+    print("\n" + "=" * 60)
+    print("Query: Who won the latest Nobel Prize in Physics?")
+    print("=" * 60)
+    print(run_agent("Who won the latest Nobel Prize in Physics?"))
