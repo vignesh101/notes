@@ -1,43 +1,53 @@
-package com.example.controller;
+package com.client.config;
 
-import com.example.security.MLEService;
-import com.example.util.ResourceReader;
-import jakarta.servlet.http.HttpServletRequest;
-import org.springframework.web.bind.annotation.*;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.*;
+import org.springframework.core.io.ClassPathResource;
+import org.springframework.http.client.*;
+import org.springframework.web.client.RestTemplate;
 
-@RestController
-@RequestMapping("/api")
-public class SecureController {
+import javax.net.ssl.*;
+import java.security.KeyStore;
 
-    private final MLEService mleService;
+@Configuration
+public class SSLConfig {
 
-    public SecureController(MLEService mleService) {
-        this.mleService = mleService;
-    }
+    @Value("${client.ssl.key-store}")
+    private String keyStore;
 
-    @GetMapping("/secure")
-    public String getEncryptedPayload(HttpServletRequest request) throws Exception {
+    @Value("${client.ssl.key-store-password}")
+    private String keyStorePassword;
 
-        // 📖 Load payload from resources
-        String payload = ResourceReader.readFile("payload.json");
+    @Value("${client.ssl.trust-store}")
+    private String trustStore;
 
-        // 🔐 Encrypt using client's certificate public key
-        return mleService.encryptPayload(payload, request);
+    @Value("${client.ssl.trust-store-password}")
+    private String trustStorePassword;
+
+    @Bean
+    public RestTemplate restTemplate() throws Exception {
+
+        KeyStore ks = KeyStore.getInstance("PKCS12");
+        ks.load(new ClassPathResource("client-keystore.p12").getInputStream(),
+                keyStorePassword.toCharArray());
+
+        KeyStore ts = KeyStore.getInstance("PKCS12");
+        ts.load(new ClassPathResource("client-truststore.p12").getInputStream(),
+                trustStorePassword.toCharArray());
+
+        KeyManagerFactory kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+        kmf.init(ks, keyStorePassword.toCharArray());
+
+        TrustManagerFactory tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+        tmf.init(ts);
+
+        SSLContext sslContext = SSLContext.getInstance("TLS");
+        sslContext.init(kmf.getKeyManagers(), tmf.getTrustManagers(), null);
+
+        HttpClient httpClient = HttpClientBuilder.create()
+                .setSSLContext(sslContext)
+                .build();
+
+        return new RestTemplate(new HttpComponentsClientHttpRequestFactory(httpClient));
     }
 }
-
-# Enable SSL
-server.ssl.enabled=true
-
-# Server identity (certificate)
-server.ssl.key-store=classpath:server-keystore.p12
-server.ssl.key-store-password=changeit
-server.ssl.key-store-type=PKCS12
-
-# Truststore (used to validate client certificate)
-server.ssl.trust-store=classpath:server-truststore.p12
-server.ssl.trust-store-password=changeit
-server.ssl.trust-store-type=PKCS12
-
-# 🔴 THIS enables mTLS
-server.ssl.client-auth=need
