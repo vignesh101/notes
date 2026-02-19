@@ -1,24 +1,15 @@
-@RestController
-@RequestMapping("/api")
-public class SecureController {
+package com.example.util;
 
-    private final MLEService mleService;
+import org.springframework.core.io.ClassPathResource;
 
-    public SecureController(MLEService mleService) {
-        this.mleService = mleService;
-    }
+import java.nio.file.Files;
 
-    @GetMapping("/secure")
-    public String getSecureData() throws Exception {
+public class ResourceReader {
 
-        String payload = """
-        {
-          "card":"4111111111111111",
-          "amount":"5000",
-          "status":"APPROVED"
-        }
-        """;
+    public static String readFile(String fileName) throws Exception {
 
-        return mleService.encrypt(payload);
+        ClassPathResource resource = new ClassPathResource(fileName);
+
+        return Files.readString(resource.getFile().toPath());
     }
 }
