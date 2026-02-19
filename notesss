@@ -1,0 +1,40 @@
+package com.example.security;
+
+import com.nimbusds.jose.*;
+import com.nimbusds.jose.crypto.RSAEncrypter;
+import com.nimbusds.jose.jwk.RSAKey;
+import org.springframework.stereotype.Service;
+
+import java.security.interfaces.RSAPublicKey;
+
+@Service
+public class MLEService {
+
+    private final RSAPublicKey clientPublicKey;
+
+    public MLEService() throws Exception {
+
+        // 🔴 Replace with client's public key (used to encrypt payload)
+        String clientPublicKeyPem = """
+                -----BEGIN PUBLIC KEY-----
+                MIIBIjANBgkqh...
+                -----END PUBLIC KEY-----
+                """;
+
+        this.clientPublicKey = PemUtils.parsePublicKey(clientPublicKeyPem);
+    }
+
+    public String encrypt(String payload) throws Exception {
+
+        JWEHeader header = new JWEHeader
+                .Builder(JWEAlgorithm.RSA_OAEP_256, EncryptionMethod.A256GCM)
+                .contentType("application/json")
+                .build();
+
+        JWEObject jweObject = new JWEObject(header, new Payload(payload));
+
+        jweObject.encrypt(new RSAEncrypter(clientPublicKey));
+
+        return jweObject.serialize();
+    }
+}
