@@ -1,26 +1,41 @@
-package com.example.controller;
+package com.example.security;
 
-import com.example.security.MLEService;
-import com.example.util.ResourceReader;
-import org.springframework.web.bind.annotation.*;
+import com.nimbusds.jose.*;
+import com.nimbusds.jose.crypto.RSAEncrypter;
+import jakarta.servlet.http.HttpServletRequest;
+import org.springframework.stereotype.Service;
 
-@RestController
-@RequestMapping("/api")
-public class SecureController {
+import java.security.PublicKey;
+import java.security.cert.X509Certificate;
 
-    private final MLEService mleService;
+@Service
+public class MLEService {
 
-    public SecureController(MLEService mleService) {
-        this.mleService = mleService;
-    }
+    public String encryptPayload(String payload, HttpServletRequest request) throws Exception {
 
-    @GetMapping("/secure")
-    public String getSecurePayload() throws Exception {
+        // 🔴 Extract client certificate from mTLS session
+        X509Certificate[] certs =
+                (X509Certificate[]) request.getAttribute("jakarta.servlet.request.X509Certificate");
 
-        // Read JSON from resources
-        String payload = ResourceReader.readFile("payload.json");
+        if (certs == null || certs.length == 0) {
+            throw new RuntimeException("Client certificate not found (mTLS failed)");
+        }
 
-        // Encrypt using MLE
-        return mleService.encrypt(payload);
+        X509Certificate clientCert = certs[0];
+        PublicKey clientPublicKey = clientCert.getPublicKey();
+
+        // 🔐 Create JWE header
+        JWEHeader header = new JWEHeader.Builder(
+                JWEAlgorithm.RSA_OAEP_256,
+                EncryptionMethod.A256GCM
+        )
+        .contentType("application/json")
+        .build();
+
+        // 🔐 Encrypt payload
+        JWEObject jweObject = new JWEObject(header, new Payload(payload));
+        jweObject.encrypt(new RSAEncrypter((java.security.interfaces.RSAPublicKey) clientPublicKey));
+
+        return jweObject.serialize();
     }
 }
