@@ -1,33 +1,32 @@
-package com.client.security;
+package com.client.controller;
 
-import com.nimbusds.jose.*;
-import com.nimbusds.jose.crypto.RSADecrypter;
-import org.springframework.stereotype.Service;
-import org.springframework.core.io.ClassPathResource;
+import com.client.security.MLEDecryptService;
+import org.springframework.beans.factory.annotation.*;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.client.RestTemplate;
 
-import java.security.KeyStore;
-import java.security.interfaces.RSAPrivateKey;
+@RestController
+@RequestMapping("/client")
+public class ClientController {
 
-@Service
-public class MLEDecryptService {
+    @Autowired
+    private RestTemplate restTemplate;
 
-    private final RSAPrivateKey privateKey;
+    @Autowired
+    private MLEDecryptService decryptService;
 
-    public MLEDecryptService() throws Exception {
+    @Value("${server.url}")
+    private String serverUrl;
 
-        KeyStore ks = KeyStore.getInstance("PKCS12");
-        ks.load(new ClassPathResource("client-keystore.p12").getInputStream(),
-                "changeit".toCharArray());
+    @GetMapping("/call")
+    public String callServer() throws Exception {
 
-        privateKey = (RSAPrivateKey) ks.getKey("client", "changeit".toCharArray());
-    }
+        // Call server
+        String encryptedResponse = restTemplate.getForObject(serverUrl, String.class);
 
-    public String decrypt(String jwe) throws Exception {
+        // Decrypt JWE payload
+        String decrypted = decryptService.decrypt(encryptedResponse);
 
-        JWEObject jweObject = JWEObject.parse(jwe);
-
-        jweObject.decrypt(new RSADecrypter(privateKey));
-
-        return jweObject.getPayload().toString();
+        return decrypted;
     }
 }
