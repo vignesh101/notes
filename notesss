@@ -1,50 +1,24 @@
-package com.example.security;
+@RestController
+@RequestMapping("/api")
+public class SecureController {
 
-import com.nimbusds.jose.*;
-import com.nimbusds.jose.crypto.RSAEncrypter;
-import org.springframework.stereotype.Service;
+    private final MLEService mleService;
 
-import java.io.InputStream;
-import java.security.KeyStore;
-import java.security.interfaces.RSAPublicKey;
-import java.security.cert.Certificate;
-
-@Service
-public class MLEService {
-
-    private final RSAPublicKey publicKey;
-
-    public MLEService() throws Exception {
-
-        String keystorePassword = "changeit";
-        String alias = "server";   // 🔴 Change to your keystore alias
-
-        KeyStore keyStore = KeyStore.getInstance("PKCS12");
-
-        InputStream is = getClass()
-                .getClassLoader()
-                .getResourceAsStream("server-keystore.p12");
-
-        keyStore.load(is, keystorePassword.toCharArray());
-
-        Certificate cert = keyStore.getCertificate(alias);
-
-        this.publicKey = (RSAPublicKey) cert.getPublicKey();
+    public SecureController(MLEService mleService) {
+        this.mleService = mleService;
     }
 
-    public String encrypt(String payload) throws Exception {
+    @GetMapping("/secure")
+    public String getSecureData() throws Exception {
 
-        JWEHeader header = new JWEHeader.Builder(
-                JWEAlgorithm.RSA_OAEP_256,
-                EncryptionMethod.A256GCM
-        )
-        .contentType("application/json")
-        .build();
+        String payload = """
+        {
+          "card":"4111111111111111",
+          "amount":"5000",
+          "status":"APPROVED"
+        }
+        """;
 
-        JWEObject jweObject = new JWEObject(header, new Payload(payload));
-
-        jweObject.encrypt(new RSAEncrypter(publicKey));
-
-        return jweObject.serialize();
+        return mleService.encrypt(payload);
     }
 }
