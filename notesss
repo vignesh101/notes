@@ -1,41 +1,17 @@
-package com.example.security;
+server.port=8443
 
-import com.nimbusds.jose.*;
-import com.nimbusds.jose.crypto.RSAEncrypter;
-import jakarta.servlet.http.HttpServletRequest;
-import org.springframework.stereotype.Service;
+# Enable SSL
+server.ssl.enabled=true
 
-import java.security.PublicKey;
-import java.security.cert.X509Certificate;
+# Server identity (certificate)
+server.ssl.key-store=classpath:server-keystore.p12
+server.ssl.key-store-password=changeit
+server.ssl.key-store-type=PKCS12
 
-@Service
-public class MLEService {
+# Truststore (used to validate client certificate)
+server.ssl.trust-store=classpath:server-truststore.p12
+server.ssl.trust-store-password=changeit
+server.ssl.trust-store-type=PKCS12
 
-    public String encryptPayload(String payload, HttpServletRequest request) throws Exception {
-
-        // 🔴 Extract client certificate from mTLS session
-        X509Certificate[] certs =
-                (X509Certificate[]) request.getAttribute("jakarta.servlet.request.X509Certificate");
-
-        if (certs == null || certs.length == 0) {
-            throw new RuntimeException("Client certificate not found (mTLS failed)");
-        }
-
-        X509Certificate clientCert = certs[0];
-        PublicKey clientPublicKey = clientCert.getPublicKey();
-
-        // 🔐 Create JWE header
-        JWEHeader header = new JWEHeader.Builder(
-                JWEAlgorithm.RSA_OAEP_256,
-                EncryptionMethod.A256GCM
-        )
-        .contentType("application/json")
-        .build();
-
-        // 🔐 Encrypt payload
-        JWEObject jweObject = new JWEObject(header, new Payload(payload));
-        jweObject.encrypt(new RSAEncrypter((java.security.interfaces.RSAPublicKey) clientPublicKey));
-
-        return jweObject.serialize();
-    }
-}
+# 🔴 THIS enables mTLS
+server.ssl.client-auth=need
