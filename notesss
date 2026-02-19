@@ -1,53 +1,49 @@
 package com.client.config;
 
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.context.annotation.*;
-import org.springframework.core.io.ClassPathResource;
-import org.springframework.http.client.*;
-import org.springframework.web.client.RestTemplate;
+import jakarta.annotation.PostConstruct;
+import org.springframework.context.annotation.Configuration;
 
 import javax.net.ssl.*;
+import java.io.InputStream;
 import java.security.KeyStore;
 
 @Configuration
 public class SSLConfig {
 
-    @Value("${client.ssl.key-store}")
-    private String keyStore;
+    @PostConstruct
+    public void init() throws Exception {
 
-    @Value("${client.ssl.key-store-password}")
-    private String keyStorePassword;
+        char[] password = "changeit".toCharArray();
 
-    @Value("${client.ssl.trust-store}")
-    private String trustStore;
+        // Load client keystore (identity)
+        KeyStore keyStore = KeyStore.getInstance("PKCS12");
+        try (InputStream is =
+                     getClass().getClassLoader().getResourceAsStream("client-keystore.p12")) {
+            keyStore.load(is, password);
+        }
 
-    @Value("${client.ssl.trust-store-password}")
-    private String trustStorePassword;
+        // Load truststore (trust server)
+        KeyStore trustStore = KeyStore.getInstance("PKCS12");
+        try (InputStream is =
+                     getClass().getClassLoader().getResourceAsStream("client-truststore.p12")) {
+            trustStore.load(is, password);
+        }
 
-    @Bean
-    public RestTemplate restTemplate() throws Exception {
+        // Key manager (client certificate)
+        KeyManagerFactory kmf =
+                KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+        kmf.init(keyStore, password);
 
-        KeyStore ks = KeyStore.getInstance("PKCS12");
-        ks.load(new ClassPathResource("client-keystore.p12").getInputStream(),
-                keyStorePassword.toCharArray());
+        // Trust manager
+        TrustManagerFactory tmf =
+                TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+        tmf.init(trustStore);
 
-        KeyStore ts = KeyStore.getInstance("PKCS12");
-        ts.load(new ClassPathResource("client-truststore.p12").getInputStream(),
-                trustStorePassword.toCharArray());
-
-        KeyManagerFactory kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
-        kmf.init(ks, keyStorePassword.toCharArray());
-
-        TrustManagerFactory tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
-        tmf.init(ts);
-
+        // SSL context
         SSLContext sslContext = SSLContext.getInstance("TLS");
         sslContext.init(kmf.getKeyManagers(), tmf.getTrustManagers(), null);
 
-        HttpClient httpClient = HttpClientBuilder.create()
-                .setSSLContext(sslContext)
-                .build();
-
-        return new RestTemplate(new HttpComponentsClientHttpRequestFactory(httpClient));
+        // Set globally for JVM
+        HttpsURLConnection.setDefaultSSLSocketFactory(sslContext.getSocketFactory());
     }
 }
