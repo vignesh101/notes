@@ -1,15 +1,26 @@
-package com.example.util;
+package com.example.controller;
 
-import org.springframework.core.io.ClassPathResource;
+import com.example.security.MLEService;
+import com.example.util.ResourceReader;
+import org.springframework.web.bind.annotation.*;
 
-import java.nio.file.Files;
+@RestController
+@RequestMapping("/api")
+public class SecureController {
 
-public class ResourceReader {
+    private final MLEService mleService;
 
-    public static String readFile(String fileName) throws Exception {
+    public SecureController(MLEService mleService) {
+        this.mleService = mleService;
+    }
 
-        ClassPathResource resource = new ClassPathResource(fileName);
+    @GetMapping("/secure")
+    public String getSecurePayload() throws Exception {
 
-        return Files.readString(resource.getFile().toPath());
+        // Read JSON from resources
+        String payload = ResourceReader.readFile("payload.json");
+
+        // Encrypt using MLE
+        return mleService.encrypt(payload);
     }
 }
