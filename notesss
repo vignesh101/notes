@@ -2,38 +2,48 @@ package com.example.security;
 
 import com.nimbusds.jose.*;
 import com.nimbusds.jose.crypto.RSAEncrypter;
-import com.nimbusds.jose.jwk.RSAKey;
 import org.springframework.stereotype.Service;
 
+import java.io.InputStream;
+import java.security.KeyStore;
 import java.security.interfaces.RSAPublicKey;
+import java.security.cert.Certificate;
 
 @Service
 public class MLEService {
 
-    private final RSAPublicKey clientPublicKey;
+    private final RSAPublicKey publicKey;
 
     public MLEService() throws Exception {
 
-        // 🔴 Replace with client's public key (used to encrypt payload)
-        String clientPublicKeyPem = """
-                -----BEGIN PUBLIC KEY-----
-                MIIBIjANBgkqh...
-                -----END PUBLIC KEY-----
-                """;
+        String keystorePassword = "changeit";
+        String alias = "server";   // 🔴 Change to your keystore alias
 
-        this.clientPublicKey = PemUtils.parsePublicKey(clientPublicKeyPem);
+        KeyStore keyStore = KeyStore.getInstance("PKCS12");
+
+        InputStream is = getClass()
+                .getClassLoader()
+                .getResourceAsStream("server-keystore.p12");
+
+        keyStore.load(is, keystorePassword.toCharArray());
+
+        Certificate cert = keyStore.getCertificate(alias);
+
+        this.publicKey = (RSAPublicKey) cert.getPublicKey();
     }
 
     public String encrypt(String payload) throws Exception {
 
-        JWEHeader header = new JWEHeader
-                .Builder(JWEAlgorithm.RSA_OAEP_256, EncryptionMethod.A256GCM)
-                .contentType("application/json")
-                .build();
+        JWEHeader header = new JWEHeader.Builder(
+                JWEAlgorithm.RSA_OAEP_256,
+                EncryptionMethod.A256GCM
+        )
+        .contentType("application/json")
+        .build();
 
         JWEObject jweObject = new JWEObject(header, new Payload(payload));
 
-        jweObject.encrypt(new RSAEncrypter(clientPublicKey));
+        jweObject.encrypt(new RSAEncrypter(publicKey));
 
         return jweObject.serialize();
     }
