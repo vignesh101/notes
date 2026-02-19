@@ -1,4 +1,30 @@
-server.port=8443
+package com.example.controller;
+
+import com.example.security.MLEService;
+import com.example.util.ResourceReader;
+import jakarta.servlet.http.HttpServletRequest;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api")
+public class SecureController {
+
+    private final MLEService mleService;
+
+    public SecureController(MLEService mleService) {
+        this.mleService = mleService;
+    }
+
+    @GetMapping("/secure")
+    public String getEncryptedPayload(HttpServletRequest request) throws Exception {
+
+        // 📖 Load payload from resources
+        String payload = ResourceReader.readFile("payload.json");
+
+        // 🔐 Encrypt using client's certificate public key
+        return mleService.encryptPayload(payload, request);
+    }
+}
 
 # Enable SSL
 server.ssl.enabled=true
