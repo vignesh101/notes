@@ -1,3 +1,208 @@
+rst, Understand the Core Idea — The Locked Box Analogy
+Imagine you want to send a secret letter to your friend:
+
+YOU have:
+  🔑 Your friend's PUBLIC key  →  like a PADLOCK your friend gave you (open)
+  🔑 Your own PRIVATE key      →  like your own secret key (only you have it)
+
+YOUR FRIEND has:
+  🔑 Their own PRIVATE key     →  only they can OPEN their padlock
+  🔑 Your PUBLIC key           →  to send secrets back to YOU
+
+Sending a secret:
+
+You  →  lock box with friend's padlock  →  only friend can open it  →  Friend
+
+Friend replies:
+
+Friend  →  lock box with YOUR padlock  →  only you can open it  →  You
+
+🔑 Two Types of Keys
+Key Type	Who Has It	What It Does
+Public Key	Everyone (shared openly)	Used to ENCRYPT (lock the box)
+Private Key	Only the owner (secret)	Used to DECRYPT (open the box)
+Rule: What PUBLIC key locks → only the matching PRIVATE key can unlock
+
+🏗️ MLE Uses TWO Algorithms (Hybrid Encryption)
+Why two algorithms?
+RSA alone  →  Very SLOW for large data (like encrypting a whole JSON)
+AES alone  →  Fast, but how do you securely share the AES key?
+
+SOLUTION: Use BOTH!
+  RSA  →  securely share a secret key (small data, slow is OK)
+  AES  →  encrypt the actual JSON data (large data, needs to be fast)
+
+📦 Step-by-Step: What Happens Inside encrypt()
+The Client wants to send this JSON to the server:
+{
+  "amount": "124.05",
+  "recipientPrimaryAccountNumber": "4957030420210496",
+  "senderName": "Mohammed Qasim"
+}
+
+Step 1 — Generate a Random Secret Key (CEK)
+🎲 Generate a random 128-bit key called CEK
+   (Content Encryption Key — a one-time-use AES key)
+
+   CEK = [random bytes: a3 f9 2b 11 ... 16 bytes total]
+
+   This key is THROWN AWAY after one use — brand new every time!
+
+Step 2 — Encrypt the JSON with CEK (AES-128-GCM)
+Plain JSON  +  CEK  +  Random IV
+     ↓
+  AES-128-GCM encryption
+     ↓
+  Ciphertext (scrambled unreadable bytes)  +  Auth Tag
+
+  Example:
+  "amount":"124.05"  →  xK9#mP@!2q...  (meaningless bytes)
+
+What is IV?
+
+IV = Initialization Vector = random number used ONCE
+     Like a salt — ensures same JSON encrypted twice gives DIFFERENT ciphertext
+     Prevents pattern attacks
+
+What is Auth Tag?
+
+Auth Tag = a fingerprint of the encrypted data
+           If anyone changes even ONE BYTE of ciphertext,
+           the Auth Tag check FAILS → decryption rejected!
+           Detects tampering.
+
+Step 3 — Encrypt the CEK with RSA (RSA-OAEP-256)
+CEK (the secret AES key)  +  Server's PUBLIC key
+          ↓
+    RSA-OAEP-256 encryption
+          ↓
+    Encrypted CEK (only server's PRIVATE key can recover this!)
+
+Now even if someone intercepts the message, they can't get the CEK — only the server's private key can unlock it.
+
+Step 4 — Assemble the JWE Token (5 Parts)
+┌─────────────────────────────────────────────────────────────────┐
+│  Part 1      Part 2          Part 3    Part 4        Part 5     │
+│  ──────      ──────          ──────    ──────        ──────     │
+│  Header   . Encrypted CEK . IV      . Ciphertext . Auth Tag    │
+│                                                                  │
+│  eyJhbGci  .  Zs9H3QkP   . aBcDeF  .  xYz9K3mP  .  tAgV4lMn  │
+└─────────────────────────────────────────────────────────────────┘
+     ↑              ↑            ↑           ↑            ↑
+  Algorithm      RSA-locked    Random      Encrypted    Tamper
+  info, keyId    AES key       nonce       JSON         detector
+
+The Header (Part 1) decoded looks like:
+
+{
+  "alg": "RSA-OAEP-256",
+  "enc": "A128GCM",
+  "kid": "7f591161-6b5f-4136-80b8-2ae8a44ad9eb",
+  "iat": 1771518680214
+}
+
+Final Output — Wrapped in JSON:
+{
+  "encData": "eyJhbGci...Zs9H3QkP...aBcDeF...xYz9K3mP...tAgV4lMn"
+}
+
+🔓 Step-by-Step: What Happens Inside decrypt()
+The server receives {"encData": "<JWE token>"} and needs to read the JSON.
+
+Step 1 — Parse the JWE Token (Split by dots)
+eyJhbGci...  .  Zs9H3QkP...  .  aBcDeF...  .  xYz9K3mP...  .  tAgV4lMn...
+     ↓               ↓              ↓               ↓                ↓
+  Header       Encrypted CEK       IV          Ciphertext        Auth Tag
+
+Step 2 — Decrypt the CEK using Server's PRIVATE Key
+Encrypted CEK  +  Server's PRIVATE key
+        ↓
+   RSA-OAEP-256 decryption
+        ↓
+   CEK recovered!  [a3 f9 2b 11 ...]
+
+Step 3 — Verify the Auth Tag
+AES-GCM checks: does the Auth Tag match the ciphertext?
+   ✅ Matches   → data is safe, proceed
+   ❌ No match  → data was TAMPERED, throw exception, reject!
+
+Step 4 — Decrypt the Ciphertext using CEK + IV
+Ciphertext  +  CEK  +  IV
+      ↓
+  AES-128-GCM decryption
+      ↓
+  Plain JSON! ✅
+
+{
+  "amount": "124.05",
+  "recipientPrimaryAccountNumber": "4957030420210496",
+  "senderName": "Mohammed Qasim"
+}
+
+🗺️ Complete Visual Flow (Client → Server → Client)
+CLIENT                                          SERVER
+  │                                               │
+  │  Plain JSON                                   │
+  │      ↓                                        │
+  │  🎲 Generate random CEK                       │
+  │      ↓                                        │
+  │  🔒 AES-GCM encrypt JSON with CEK             │
+  │      → Ciphertext + Auth Tag                  │
+  │      ↓                                        │
+  │  🔒 RSA encrypt CEK with SERVER public key    │
+  │      → Encrypted CEK                          │
+  │      ↓                                        │
+  │  📦 Assemble JWE token (5 parts)              │
+  │      ↓                                        │
+  │  {"encData": "eyJ..."}  ─────────────────►   │
+  │                                               │  📦 Parse JWE (split by '.')
+  │                                               │  🔓 RSA decrypt Encrypted CEK
+  │                                               │      using SERVER private key
+  │                                               │      → recover CEK
+  │                                               │  ✅ Verify Auth Tag
+  │                                               │  🔓 AES-GCM decrypt Ciphertext
+  │                                               │      using CEK + IV
+  │                                               │      → Plain JSON ✅
+  │                                               │
+  │                                               │  📝 Process transaction...
+  │                                               │
+  │                                               │  🎲 Generate NEW random CEK
+  │                                               │  🔒 AES-GCM encrypt response
+  │                                               │  🔒 RSA encrypt CEK
+  │                                               │      with CLIENT public key
+  │                                               │  📦 Assemble JWE
+  │   ◄─────────────────  {"encData": "eyJ..."}  │
+  │                                               │
+  │  📦 Parse JWE                                 │
+  │  🔓 RSA decrypt with CLIENT private key       │
+  │  ✅ Verify Auth Tag                           │
+  │  🔓 AES-GCM decrypt → Plain JSON ✅          │
+
+🔑 Which Key Is Used Where?
+                      ENCRYPT WITH          DECRYPT WITH
+                    ┌──────────────────┬──────────────────────┐
+Client → Server     │ Server PUBLIC key │ Server PRIVATE key   │
+(request)           │ (mle-server-     │ (mle-server-         │
+                    │  public.pem)     │  private.pem)        │
+                    ├──────────────────┼──────────────────────┤
+Server → Client     │ Client PUBLIC key│ Client PRIVATE key   │
+(response)          │ (mle-client-     │ (mle-client-         │
+                    │  public.pem)     │  private.pem)        │
+                    └──────────────────┴──────────────────────┘
+
+🧩 Why Each Piece Exists (Summary)
+Piece	Algorithm	Why It's Needed
+RSA-OAEP-256	Asymmetric (public/private key)	Safely shares the secret AES key
+AES-128-GCM	Symmetric (same key both sides)	Fast encryption of actual JSON data
+CEK	Random 128-bit key	One-time AES key, different for every message
+IV / Nonce	Random 96-bit value	Same JSON encrypted twice → different output
+Auth Tag	GMAC 128-bit fingerprint	Detects if ciphertext was tampered
+kid (Key ID)	"7f591161-..."	Tells server which key to use for decryption
+iat	Timestamp	Helps detect replay attacks (reusing old tokens)
+🎯 One-Line Summary
+MLE = RSA locks the AES key → AES locks the data → both travel together as a JWE token → only the right private key can unlock everything
+
+
 How MLE Encryption Works
 MLE uses JWE (JSON Web Encryption) — a standard that combines asymmetric RSA (to share a secret key) with symmetric AES (to encrypt the actual data). Here's exactly how it works step by step:
 
