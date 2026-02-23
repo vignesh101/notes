@@ -1,0 +1,111 @@
+import subprocess
+import json
+import queue
+import threading
+from vosk import Model, KaldiRecognizer
+
+VIDEO_SOURCE = "https://example.com/video.mp4"   # RTSP / URL / file
+MODEL_PATH = "models/vosk-model-small-en-us-0.15"
+SAMPLE_RATE = 16000
+
+transcript_buffer = []
+audio_queue = queue.Queue()
+stop_flag = False
+
+
+# ---------------------------------------------------------
+# FFmpeg streaming audio extractor (no download)
+# ---------------------------------------------------------
+def stream_audio():
+    global stop_flag
+
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-loglevel", "quiet",
+        "-i", VIDEO_SOURCE,
+        "-ar", str(SAMPLE_RATE),
+        "-ac", "1",
+        "-f", "s16le",
+        "-"
+    ]
+
+    process = subprocess.Popen(
+        ffmpeg_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0
+    )
+
+    while not stop_flag:
+        data = process.stdout.read(4000)
+        if not data:
+            break
+        audio_queue.put(data)
+
+    stop_flag = True
+    process.kill()
+
+
+# ---------------------------------------------------------
+# Transcription worker
+# ---------------------------------------------------------
+def transcribe_audio():
+    global stop_flag
+
+    model = Model(MODEL_PATH)
+    recognizer = KaldiRecognizer(model, SAMPLE_RATE)
+
+    print("🎤 Transcription started...\n")
+
+    while not stop_flag or not audio_queue.empty():
+        try:
+            data = audio_queue.get(timeout=1)
+        except:
+            continue
+
+        if recognizer.AcceptWaveform(data):
+            result = json.loads(recognizer.Result())
+            text = result.get("text", "")
+            if text:
+                transcript_buffer.append(text)
+                print("📝", text)
+
+    final = json.loads(recognizer.FinalResult())
+    if final.get("text"):
+        transcript_buffer.append(final["text"])
+
+
+# ---------------------------------------------------------
+# Simple summarizer (replace with LLM later)
+# ---------------------------------------------------------
+def summarize_text(text):
+    sentences = text.split(".")
+    if len(sentences) <= 5:
+        return text
+    return ". ".join(sentences[:5]) + "..."
+
+
+# ---------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------
+def main():
+    audio_thread = threading.Thread(target=stream_audio)
+    stt_thread = threading.Thread(target=transcribe_audio)
+
+    audio_thread.start()
+    stt_thread.start()
+
+    audio_thread.join()
+    stt_thread.join()
+
+    print("\n📜 Full Transcript:\n")
+    full_text = " ".join(transcript_buffer)
+    print(full_text)
+
+    print("\n📌 Summary:\n")
+    summary = summarize_text(full_text)
+    print(summary)
+
+
+if __name__ == "__main__":
+    main()
