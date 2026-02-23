@@ -1,32 +1,1763 @@
-package com.client.controller;
+# Technical Specification — Visa-like API with mTLS + MLE
 
-import com.client.security.MLEDecryptService;
-import org.springframework.beans.factory.annotation.*;
-import org.springframework.web.bind.annotation.*;
-import org.springframework.web.client.RestTemplate;
+**Project:** visa-projects
+**Version:** 1.0.0
+**Date:** 2026-02-23
+**Platform:** Java 17 / Spring Boot 3.2.5
 
-@RestController
-@RequestMapping("/client")
-public class ClientController {
+---
 
-    @Autowired
-    private RestTemplate restTemplate;
+## Table of Contents
 
-    @Autowired
-    private MLEDecryptService decryptService;
+1. [Project Purpose](#1-project-purpose)
+2. [Repository Layout](#2-repository-layout)
+3. [Technology Stack](#3-technology-stack)
+4. [Security Architecture — Three Layers](#4-security-architecture--three-layers)
+5. [Certificate and Key Infrastructure](#5-certificate-and-key-infrastructure)
+6. [Server — Deep Dive](#6-server--deep-dive)
+7. [Client — Deep Dive](#7-client--deep-dive)
+8. [End-to-End Request Lifecycle](#8-end-to-end-request-lifecycle)
+9. [API Reference](#9-api-reference)
+10. [Configuration Reference](#10-configuration-reference)
+11. [Installation and Setup](#11-installation-and-setup)
+12. [Running the System](#12-running-the-system)
+13. [Expected Output](#13-expected-output)
+14. [How the JWE Token is Structured](#14-how-the-jwe-token-is-structured)
+15. [Key Concepts Explained](#15-key-concepts-explained)
+16. [Troubleshooting Guide](#16-troubleshooting-guide)
 
-    @Value("${server.url}")
-    private String serverUrl;
+---
 
-    @GetMapping("/call")
-    public String callServer() throws Exception {
+## 1. Project Purpose
 
-        // Call server
-        String encryptedResponse = restTemplate.getForObject(serverUrl, String.class);
+This project is a **self-contained simulation of the Visa Direct API security model**. It consists of two Spring Boot applications — a server and a client — that communicate using the same security stack as the real Visa API:
 
-        // Decrypt JWE payload
-        String decrypted = decryptService.decrypt(encryptedResponse);
+| Security Layer | Purpose |
+|----------------|---------|
+| **Mutual TLS (mTLS)** | Both sides authenticate each other at the transport (TCP/TLS) level using X.509 certificates |
+| **HTTP Basic Authentication** | Application-level identity verification using a user ID and password |
+| **Message Level Encryption (MLE)** | Each JSON request and response body is individually encrypted using JWE, so payloads remain confidential even if the transport layer is compromised |
 
-        return decrypted;
+The original Visa `PushFundsAndQueryAPIWithMLE` sample code connects to `sandbox.api.visa.com`. This project replaces that remote server with a local Spring Boot server (`visa-server`) that behaves identically, running on `https://localhost:8443`.
+
+Two operations are demonstrated:
+
+1. **Push Funds Transaction (OCT)** — sends money to a recipient card
+2. **Transaction Query** — retrieves the status of a previously completed transaction
+
+---
+
+## 2. Repository Layout
+
+```
+visa-projects/
+│
+├── README.md                          Project overview
+├── MTLS-AND-MLE-FLOW.md              Deep-dive protocol documentation
+├── TECHNICAL-SPECIFICATION.md        This file
+│
+├── certs/                            All cryptographic material
+│   ├── generate-certs.sh             Certificate generation script (bash)
+│   ├── CERTIFICATES.md               Certificate generation guide
+│   │
+│   ├── ca.crt                        CA root certificate (trust anchor)
+│   │
+│   ├── server-keystore.p12           Server TLS cert + private key (PKCS12)
+│   ├── server-truststore.p12         CA cert (server trusts clients signed by CA)
+│   ├── server-tls.crt                Server TLS certificate (PEM, informational)
+│   │
+│   ├── client-keystore.p12           Client TLS cert + private key (PKCS12)
+│   ├── client-truststore.p12         CA cert (client trusts server signed by CA)
+│   ├── client-tls.crt                Client TLS certificate (PEM, informational)
+│   │
+│   ├── mle-server-private.pem        Server MLE RSA private key (PKCS#1)
+│   ├── mle-server-public.pem         Server MLE public certificate (X.509)
+│   ├── mle-client-private.pem        Client MLE RSA private key (PKCS#1)
+│   └── mle-client-public.pem         Client MLE public certificate (X.509)
+│
+├── visa-server/                      Spring Boot Server (simulates Visa API)
+│   ├── pom.xml
+│   └── src/main/
+│       ├── resources/
+│       │   └── application.yml
+│       └── java/com/visa/server/
+│           ├── VisaServerApplication.java       Entry point
+│           ├── config/
+│           │   └── SecurityConfig.java          Basic Auth + Spring Security
+│           ├── controller/
+│           │   └── FundsTransferController.java REST endpoints
+│           ├── service/
+│           │   ├── MLEService.java              JWE encrypt/decrypt
+│           │   └── TransactionStore.java        In-memory transaction store
+│           └── model/
+│               └── EncryptedPayload.java        {"encData": "..."} wrapper
+│
+└── visa-client/                      Spring Boot Client
+    ├── pom.xml
+    └── src/main/
+        ├── resources/
+        │   └── application.yml
+        └── java/com/visa/client/
+            ├── VisaClientApplication.java       Entry point + demo runner
+            ├── config/
+            │   └── SSLConfig.java               mTLS SSLContext setup
+            ├── service/
+            │   ├── MLEService.java              JWE encrypt/decrypt
+            │   └── VisaApiService.java          HTTP client with mTLS+MLE
+            └── model/
+                └── EncryptedPayload.java        {"encData": "..."} wrapper
+```
+
+---
+
+## 3. Technology Stack
+
+| Component | Technology | Version |
+|-----------|-----------|---------|
+| Language | Java | 17 |
+| Framework | Spring Boot | 3.2.5 |
+| Build tool | Maven | 3.6+ |
+| Web layer | Spring Boot Starter Web (Tomcat) | 3.2.5 |
+| Security | Spring Boot Starter Security | 3.2.5 |
+| JWE library | Nimbus JOSE + JWT | 9.37.3 |
+| Key parsing | Bouncy Castle (`bcprov-jdk18on`) | 1.77 |
+| TLS protocol | TLS 1.2 and 1.3 | — |
+| Key format | RSA 2048-bit | — |
+| JWE algorithm | RSA-OAEP-256 + A128GCM | — |
+| Cert format | X.509 / PKCS12 / PEM | — |
+| HTTP client | `java.net.HttpURLConnection` | JDK built-in |
+| Password hashing | BCrypt | Spring Security built-in |
+
+---
+
+## 4. Security Architecture — Three Layers
+
+Every API call passes through all three layers in this order — outermost first:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Layer 3: MLE (Message Level Encryption)                             │
+│                                                                      │
+│  The HTTP body is a JWE token, not plain JSON:                       │
+│  {"encData": "eyJlbmMiOiJBMTI4R0NNIiwiYWxnIjoiUlNBLU9BRVAtMjU2..."}│
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────────┐  │
+│  │  Layer 2: HTTP Basic Authentication                            │  │
+│  │                                                                │  │
+│  │  Authorization: Basic MVdNMlRUNElIUFhDOERRNUkzQ0gyMW4xckVCR...│  │
+│  │                                                                │  │
+│  │  ┌──────────────────────────────────────────────────────────┐  │  │
+│  │  │  Layer 1: Mutual TLS (mTLS)                              │  │  │
+│  │  │                                                          │  │  │
+│  │  │  TCP connection is TLS-encrypted.                        │  │  │
+│  │  │  Client presents its certificate.                        │  │  │
+│  │  │  Server presents its certificate.                        │  │  │
+│  │  │  Both sides verify the other via a shared CA.            │  │  │
+│  │  └──────────────────────────────────────────────────────────┘  │  │
+│  └────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Layer 1: Mutual TLS (mTLS)
+
+In standard TLS only the server proves its identity. mTLS requires **both sides** to prove identity using X.509 certificates.
+
+```
+CLIENT (visa-client)                  SERVER (visa-server)
+       │                                      │
+       │───── ClientHello ──────────────────► │
+       │                                      │
+       │◄──── ServerHello ─────────────────── │
+       │◄──── Server Certificate ──────────── │  (server-keystore.p12)
+       │◄──── CertificateRequest ────────────  │  ← server DEMANDS client cert
+       │                                      │
+       │───── Client Certificate ───────────► │  (client-keystore.p12)
+       │───── CertificateVerify ────────────► │  (signature with client private key)
+       │                                      │
+       │◄═══ Encrypted TLS channel ══════════►│
+```
+
+**How the server enforces client certificates:**
+
+In `visa-server/src/main/resources/application.yml`:
+```yaml
+server:
+  ssl:
+    client-auth: need   # ← "need" = reject connections without a valid client cert
+```
+
+The `need` value causes Tomcat to send a `CertificateRequest` message during the TLS handshake. Any client that cannot present a certificate signed by the trusted CA gets a fatal TLS alert.
+
+**How each side verifies the other:**
+
+- The **server** verifies the client certificate against `server-truststore.p12` (contains the CA cert)
+- The **client** verifies the server certificate against `client-truststore.p12` (contains the same CA cert)
+- Both keystores contain the same CA cert — this is the shared trust anchor
+
+### Layer 2: Basic Authentication
+
+Over the already-secure mTLS channel, every request carries an `Authorization` header:
+
+```
+Authorization: Basic MVdNMlRUNElIUFhDOERRNUkzQ0gyMW4xckVCR0stRXl2X29MZHpFMlZacERxUm5fVToxOUpSVmRlajk=
+```
+
+This is `base64(userId + ":" + password)`.
+
+**Client side** — constructed in `VisaApiService.invokeAPI()`:
+```java
+byte[] encodedAuth = Base64.getEncoder().encode(
+    (userId + ":" + password).getBytes(StandardCharsets.UTF_8));
+con.setRequestProperty("Authorization", "Basic " + new String(encodedAuth));
+```
+
+**Server side** — validated by Spring Security in `SecurityConfig.java`:
+```java
+http
+    .httpBasic(basic -> {})            // enables HTTP Basic Auth
+    .authorizeHttpRequests(auth -> auth
+        .anyRequest().authenticated()  // every endpoint requires auth
+    )
+    .sessionManagement(session ->
+        session.sessionCreationPolicy(SessionCreationPolicy.STATELESS)  // no cookies
+    );
+```
+
+The configured credentials are stored in an in-memory `UserDetailsService` with BCrypt-hashed passwords. BCrypt is a one-way hashing function — the stored value is never the plain password.
+
+### Layer 3: Message Level Encryption (MLE)
+
+Even though mTLS encrypts the transport, MLE encrypts the payload **itself**. This means the JSON data remains confidential even if:
+- A TLS termination proxy inspects traffic
+- Log systems inadvertently capture request bodies
+- A man-in-the-middle breaks the outer TLS (defense in depth)
+
+MLE uses **JWE (JSON Web Encryption)** with:
+
+| Parameter | Value | Meaning |
+|-----------|-------|---------|
+| Algorithm (`alg`) | `RSA-OAEP-256` | RSA Optimal Asymmetric Encryption Padding with SHA-256. Used to encrypt the symmetric content encryption key (CEK). |
+| Encryption (`enc`) | `A128GCM` | AES-128-GCM. The CEK encrypts the actual payload. GCM provides authenticated encryption (tampering is detectable). |
+| Key ID (`kid`) | `7f591161-6b5f-4136-80b8-2ae8a44ad9eb` | Identifies which key pair was used. Allows key rotation. |
+| Issued At (`iat`) | Unix timestamp milliseconds | Custom claim — timestamp of when the JWE was created. |
+
+**MLE key matrix** — which key is used for each direction:
+
+| Direction | Operation | Key Used |
+|-----------|-----------|---------|
+| Client → Server (request) | Client **encrypts** | `mle-server-public.pem` |
+| Client → Server (request) | Server **decrypts** | `mle-server-private.pem` |
+| Server → Client (response) | Server **encrypts** | `mle-client-public.pem` |
+| Server → Client (response) | Client **decrypts** | `mle-client-private.pem` |
+
+The envelope format on the wire is always:
+```json
+{"encData": "<JWE compact serialization>"}
+```
+
+---
+
+## 5. Certificate and Key Infrastructure
+
+The system uses **two independent sets of cryptographic material** serving different purposes.
+
+### Set 1: mTLS Certificates (Transport Security)
+
+These are CA-signed X.509 certificates that form a trust chain.
+
+```
+                ┌──────────────────────┐
+                │   Certificate Auth.   │
+                │      (CA Root)        │
+                │      ca.crt           │
+                │   (self-signed)       │
+                └──────────┬───────────┘
+                           │ CA signs both
+              ┌────────────┴────────────┐
+              ▼                         ▼
+ ┌────────────────────┐     ┌────────────────────┐
+ │  Server TLS Cert   │     │  Client TLS Cert   │
+ │  CN=localhost      │     │  CN=visa-client    │
+ │  SAN: DNS:localhost│     │  extKeyUsage:      │
+ │       IP:127.0.0.1 │     │    clientAuth      │
+ │  extKeyUsage:      │     │                    │
+ │    serverAuth      │     │  client-keystore   │
+ │                    │     │  .p12              │
+ │  server-keystore   │     └────────────────────┘
+ │  .p12              │
+ └────────────────────┘
+```
+
+| File | Type | Contents | Used By |
+|------|------|----------|---------|
+| `ca.crt` | X.509 PEM | CA public certificate | Imported into both truststores |
+| `server-keystore.p12` | PKCS12 | Server cert + server private key + CA cert | Server (its TLS identity) |
+| `server-truststore.p12` | PKCS12 | CA cert | Server (verifies client certs) |
+| `client-keystore.p12` | PKCS12 | Client cert + client private key + CA cert | Client (its TLS identity) |
+| `client-truststore.p12` | PKCS12 | CA cert | Client (verifies server cert) |
+
+**Certificate extensions explained:**
+
+The server certificate has `subjectAltName=DNS:localhost,IP:127.0.0.1`. Modern TLS clients (Java 17+) **ignore** the CN field and validate the hostname against the SAN. Without this SAN, connections to `localhost` or `127.0.0.1` would fail with `No subject alternative names matching` even though the cert says CN=localhost.
+
+The server cert has `extendedKeyUsage=serverAuth` and the client cert has `extendedKeyUsage=clientAuth`. This prevents certificate misuse — a server cert cannot be used as a client cert and vice versa.
+
+### Set 2: MLE Key Pairs (Payload Security)
+
+These are **self-signed** RSA key pairs. They are NOT part of the CA trust chain. They are exchanged out-of-band as files.
+
+```
+┌─────────────────────────────┐    ┌─────────────────────────────┐
+│     MLE Server Key Pair     │    │     MLE Client Key Pair     │
+│                             │    │                             │
+│  Private: mle-server-       │    │  Private: mle-client-       │
+│           private.pem       │    │           private.pem       │
+│  (kept only on server)      │    │  (kept only on client)      │
+│                             │    │                             │
+│  Public:  mle-server-       │    │  Public:  mle-client-       │
+│           public.pem        │    │           public.pem        │
+│  (shared with client)       │    │  (shared with server)       │
+│                             │    │                             │
+│  Used to encrypt REQUESTS   │    │  Used to encrypt RESPONSES  │
+└─────────────────────────────┘    └─────────────────────────────┘
+```
+
+**PEM key formats:**
+
+MLE private keys are stored in **PKCS#1 format** (the Visa standard):
+```
+-----BEGIN RSA PRIVATE KEY-----
+MIIEpAIBAAKCAQEA... (base64 encoded ASN.1 DER)
+-----END RSA PRIVATE KEY-----
+```
+
+MLE public keys are stored as **X.509 PEM certificates** (not raw public keys):
+```
+-----BEGIN CERTIFICATE-----
+MIICpDCCAYwCCQC... (base64 encoded DER certificate)
+-----END CERTIFICATE-----
+```
+
+The reason for using certificates (not raw public keys) is that the Visa MLE specification distributes public keys as certificates, following industry standard. The code extracts the RSA public key from the certificate using `CertificateFactory.getInstance("X.509")`.
+
+### Certificate Generation Script
+
+The script `certs/generate-certs.sh` performs all 8 steps in sequence:
+
+```
+Step 1: CA private key (RSA 2048) + self-signed certificate
+Step 2: Server TLS private key + CSR + CA-signed cert + PKCS12 keystore
+Step 3: Client TLS private key + CSR + CA-signed cert + PKCS12 keystore
+Step 4: Server truststore (import CA cert via keytool)
+Step 5: Client truststore (import CA cert via keytool)
+Step 6: MLE Server RSA key pair → PKCS#1 PEM format
+Step 7: MLE Client RSA key pair → PKCS#1 PEM format
+Step 8: Cleanup temporary files (*.key, *.csr, *.cnf, *.srl)
+```
+
+The script sets `MSYS_NO_PATHCONV=1` at the top. This is required on Windows Git Bash, which by default converts Unix-style paths like `/C=US` in OpenSSL `-subj` arguments to Windows paths like `C:/Program Files/Git/C=US`.
+
+---
+
+## 6. Server — Deep Dive
+
+The server runs on `https://localhost:8443` and simulates the Visa Direct API.
+
+### 6.1 VisaServerApplication.java
+
+**Location:** `visa-server/src/main/java/com/visa/server/VisaServerApplication.java`
+
+```java
+@SpringBootApplication
+public class VisaServerApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(VisaServerApplication.class, args);
+        System.out.println("Visa Server started on https://localhost:8443");
     }
 }
+```
+
+The `@SpringBootApplication` annotation activates:
+- `@ComponentScan` — finds all `@Service`, `@RestController`, `@Configuration` classes
+- `@EnableAutoConfiguration` — auto-configures Spring Security, Tomcat SSL based on `application.yml`
+
+SSL is configured entirely through `application.yml` — Spring Boot auto-configures Tomcat's SSL connector. The server does NOT need to write any SSL Java code.
+
+### 6.2 SecurityConfig.java
+
+**Location:** `visa-server/src/main/java/com/visa/server/config/SecurityConfig.java`
+
+This class configures all application-level security. It has three beans:
+
+**Bean 1: `SecurityFilterChain`**
+
+```java
+@Bean
+public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+    http
+        .csrf(csrf -> csrf.disable())                                    // REST APIs don't need CSRF protection
+        .sessionManagement(session ->
+            session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))  // no HTTP session
+        .authorizeHttpRequests(auth -> auth
+            .anyRequest().authenticated()                                // every endpoint requires login
+        )
+        .httpBasic(basic -> {});                                         // enable HTTP Basic Auth
+    return http.build();
+}
+```
+
+Why CSRF is disabled: CSRF attacks require a browser session with cookies. Since this is a stateless REST API with Basic Auth (no cookies), CSRF protection is unnecessary overhead.
+
+**Bean 2: `UserDetailsService`**
+
+```java
+@Bean
+public UserDetailsService userDetailsService(PasswordEncoder passwordEncoder) {
+    var user = User.builder()
+            .username(userId)
+            .password(passwordEncoder.encode(password))     // BCrypt hash
+            .roles("API_USER")
+            .build();
+    return new InMemoryUserDetailsManager(user);
+}
+```
+
+The credentials come from `application.yml`:
+```yaml
+visa:
+  auth:
+    user-id: "1WM2TT4IHPXC8DQ5I3CH21n1rEBGK-Eyv_oLdzE2VZpDqRn_U"
+    password: "19JRVdej9"
+```
+
+BCrypt hashes the password at startup. Every incoming Basic Auth request is validated by hashing the received password and comparing it to the stored BCrypt hash.
+
+**Bean 3: `PasswordEncoder`**
+
+```java
+@Bean
+public PasswordEncoder passwordEncoder() {
+    return new BCryptPasswordEncoder();
+}
+```
+
+### 6.3 FundsTransferController.java
+
+**Location:** `visa-server/src/main/java/com/visa/server/controller/FundsTransferController.java`
+
+This REST controller exposes two endpoints. It has three injected dependencies:
+- `MLEService` — JWE encrypt/decrypt
+- `TransactionStore` — in-memory transaction storage
+- `ObjectMapper` — JSON serialization/deserialization
+
+**Endpoint 1: Push Funds — POST**
+
+```java
+@PostMapping("/visadirect/fundstransfer/v1/pushfundstransactions")
+public ResponseEntity<EncryptedPayload> pushFunds(
+        @RequestBody EncryptedPayload encryptedRequest,
+        @RequestHeader("keyId") String keyId)
+```
+
+Processing steps:
+1. Receive `EncryptedPayload` — Spring MVC deserializes `{"encData":"<JWE>"}` automatically
+2. Call `mleService.decryptPayload(encryptedRequest.getEncData())` → get plain JSON
+3. Parse the JSON to `Map<String, Object>`
+4. Call `processTransaction(requestData)` → simulate Visa processing
+5. Serialize the response map to JSON
+6. Call `mleService.encryptPayload(responseJson)` → get JWE token
+7. Return `ResponseEntity.ok(new EncryptedPayload(jweToken))`
+
+The `processTransaction()` method:
+- Reads `transactionIdentifier` from the request (or generates one with `generateTransactionId()`)
+- Sets `actionCode = "00"` (Visa approval code for success)
+- Generates a 6-digit `approvalCode` randomly
+- Sets `responseCode = "5"` (Visa response code)
+- Records `transmissionDateTime` (current time, ISO 8601)
+- Masks the `recipientPrimaryAccountNumber` — shows first 4 and last 4 digits, replaces middle with `****`
+- Stores the complete transaction data in `TransactionStore`
+
+**PAN masking logic:**
+```java
+private String maskPan(String pan) {
+    if (pan != null && pan.length() > 8) {
+        return pan.substring(0, 4) + "****" + pan.substring(pan.length() - 4);
+    }
+    return pan;
+}
+```
+Example: `4957030420210496` becomes `4957****0496`
+
+**Endpoint 2: Transaction Query — GET**
+
+```java
+@GetMapping("/visadirect/v1/transactionquery")
+public ResponseEntity<EncryptedPayload> queryTransaction(
+        @RequestParam("acquiringBIN") String acquiringBin,
+        @RequestParam("transactionIdentifier") String transactionIdentifier,
+        @RequestHeader("keyId") String keyId)
+```
+
+Processing steps:
+1. Look up transaction in `TransactionStore` using both `transactionIdentifier` AND `acquiringBin`
+2. If found: build COMPLETED response with transaction details
+3. If not found: build NOT_FOUND response with error message
+4. Encrypt response and return
+
+Note: GET requests have **no request body**, so there is no MLE request decryption step. Only the response is MLE-encrypted.
+
+### 6.4 MLEService.java (Server)
+
+**Location:** `visa-server/src/main/java/com/visa/server/service/MLEService.java`
+
+Loaded at startup via `@PostConstruct`:
+- `mle-server-private.pem` → `PrivateKey` object (used to **decrypt** incoming requests)
+- `mle-client-public.pem` → `RSAPublicKey` object (used to **encrypt** outgoing responses)
+
+**`decryptPayload(String jweToken)`**
+
+```java
+public String decryptPayload(String jweToken) throws ParseException, JOSEException {
+    JWEObject jweObject = JWEObject.parse(jweToken);       // parse the 5-part compact JWE
+    jweObject.decrypt(new RSADecrypter(serverPrivateKey)); // RSA-OAEP-256 key unwrapping + AES-128-GCM decryption
+    return jweObject.getPayload().toString();               // return plain JSON
+}
+```
+
+**`encryptPayload(String plaintext)`**
+
+```java
+public String encryptPayload(String plaintext) throws JOSEException {
+    JWEHeader.Builder headerBuilder = new JWEHeader.Builder(
+            JWEAlgorithm.RSA_OAEP_256,
+            EncryptionMethod.A128GCM
+    );
+    headerBuilder.keyID(keyId);
+    headerBuilder.customParam("iat", System.currentTimeMillis());
+
+    JWEObject jweObject = new JWEObject(headerBuilder.build(), new Payload(plaintext));
+    jweObject.encrypt(new RSAEncrypter(clientPublicKey));  // RSA-OAEP-256 + AES-128-GCM
+    return jweObject.serialize();                          // compact serialization (5 base64url parts)
+}
+```
+
+**Private key loading — supports two PEM formats:**
+
+*PKCS#1 (`-----BEGIN RSA PRIVATE KEY-----`)* — the Visa standard format, parsed manually via BouncyCastle ASN.1:
+
+```java
+ASN1Sequence sequence = (ASN1Sequence) ASN1Sequence.fromByteArray(decoded);
+// PKCS#1 RSAPrivateKey ASN.1 structure:
+// RSAPrivateKey ::= SEQUENCE {
+//   version           INTEGER,   -- 0 = two-prime, 1 = multi-prime
+//   modulus           INTEGER,   -- n
+//   publicExponent    INTEGER,   -- e (65537)
+//   privateExponent   INTEGER,   -- d  ← the actual private key value
+//   ...
+// }
+BigInteger version        = ((ASN1Integer) elements.nextElement()).getValue();
+BigInteger modulus        = ((ASN1Integer) elements.nextElement()).getValue();
+((ASN1Integer) elements.nextElement()).getValue(); // publicExponent (skip)
+BigInteger privateExponent = ((ASN1Integer) elements.nextElement()).getValue();
+
+RSAPrivateKeySpec keySpec = new RSAPrivateKeySpec(modulus, privateExponent);
+return KeyFactory.getInstance("RSA").generatePrivate(keySpec);
+```
+
+*PKCS#8 (`-----BEGIN PRIVATE KEY-----`)* — newer OpenSSL default, parsed via Java standard library:
+
+```java
+return KeyFactory.getInstance("RSA").generatePrivate(new PKCS8EncodedKeySpec(decoded));
+```
+
+**Public key loading:**
+
+MLE public keys are stored as X.509 certificates (PEM format). The code strips the PEM headers, base64-decodes the DER bytes, parses the X.509 certificate, and extracts the RSA public key:
+
+```java
+Certificate cert = CertificateFactory.getInstance("X.509")
+        .generateCertificate(new ByteArrayInputStream(decoded));
+return (RSAPublicKey) cert.getPublicKey();
+```
+
+### 6.5 TransactionStore.java
+
+**Location:** `visa-server/src/main/java/com/visa/server/service/TransactionStore.java`
+
+```java
+@Service
+public class TransactionStore {
+    private final ConcurrentHashMap<String, Map<String, Object>> transactions
+            = new ConcurrentHashMap<>();
+
+    public void save(String transactionIdentifier, Map<String, Object> transactionData) {
+        transactions.put(transactionIdentifier, transactionData);
+    }
+
+    public Map<String, Object> findByIdentifierAndBin(
+            String transactionIdentifier, String acquiringBin) {
+        Map<String, Object> txn = transactions.get(transactionIdentifier);
+        if (txn != null) {
+            String storedBin = String.valueOf(txn.get("acquiringBin"));
+            if (storedBin.equals(acquiringBin)) {
+                return txn;
+            }
+        }
+        return null;
+    }
+}
+```
+
+`ConcurrentHashMap` is used because HTTP requests can be processed concurrently by Tomcat's thread pool. It provides thread-safe reads and writes without explicit synchronization.
+
+The query checks **both** `transactionIdentifier` AND `acquiringBin` — matching the real Visa API behavior where both fields are required to retrieve a transaction.
+
+**Limitation:** This is in-memory storage. Data is lost when the server restarts. In a production system, this would be replaced by a database (PostgreSQL, Oracle, etc.).
+
+### 6.6 EncryptedPayload.java (Server)
+
+**Location:** `visa-server/src/main/java/com/visa/server/model/EncryptedPayload.java`
+
+```java
+public class EncryptedPayload {
+    @JsonProperty("encData")
+    private String encData;
+    // constructors, getters, setters
+}
+```
+
+`@JsonProperty("encData")` ensures the JSON field name is exactly `encData` (camelCase), matching the Visa MLE wire format, regardless of Java naming conventions. Spring MVC uses Jackson to serialize/deserialize this class automatically when endpoints declare it as `@RequestBody` or return type.
+
+---
+
+## 7. Client — Deep Dive
+
+The client runs on port 8080 and connects to the server at `https://localhost:8443`. It executes the full demo flow on startup and exits.
+
+### 7.1 VisaClientApplication.java
+
+**Location:** `visa-client/src/main/java/com/visa/client/VisaClientApplication.java`
+
+```java
+@SpringBootApplication
+public class VisaClientApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(VisaClientApplication.class, args);
+    }
+
+    @Bean
+    public CommandLineRunner run(VisaApiService visaApiService, ObjectMapper objectMapper) {
+        return args -> {
+            // 1. Build push funds request payload
+            // 2. Call visaApiService.pushFunds(payload)
+            // 3. Extract transactionIdentifier from response
+            // 4. Call visaApiService.queryTransaction(bin, transactionId)
+            // 5. Print results
+        };
+    }
+}
+```
+
+`CommandLineRunner` is a Spring Boot interface whose `run()` method is called automatically after the application context is fully started. This is how the demo executes after all beans (including `SSLContext` and loaded MLE keys) are ready.
+
+**Push funds request payload** (built with `Map.ofEntries()`):
+
+| Field | Example Value | Description |
+|-------|--------------|-------------|
+| `amount` | `"124.05"` | Transaction amount |
+| `acquiringBin` | `"408999"` | Acquiring Bank Identification Number |
+| `recipientPrimaryAccountNumber` | `"4957030420210496"` | Recipient card number (PAN) |
+| `senderName` | `"Mohammed Qasim"` | Sender full name |
+| `recipientName` | `"rohan"` | Recipient name |
+| `transactionIdentifier` | `"381228649430015"` | Visa transaction ID |
+| `businessApplicationId` | `"AA"` | AA = Account-to-account transfer |
+| `transactionCurrencyCode` | `"USD"` | ISO 4217 currency code |
+| `merchantCategoryCode` | `"6012"` | MCC 6012 = Financial institutions |
+| `senderAddress` | `"901 Metro Center Blvd"` | Sender's address |
+| `senderCity` | `"Foster City"` | Sender's city |
+| `senderStateCode` | `"CA"` | Sender's state |
+| `senderCountryCode` | `"124"` | ISO 3166-1 numeric (124 = Canada) |
+| `sourceOfFundsCode` | `"05"` | 05 = Credit |
+| `settlementServiceIndicator` | `"9"` | Settlement service type |
+| `systemsTraceAuditNumber` | `"451018"` | Unique per-transaction trace number |
+| `retrievalReferenceNumber` | `"412770451018"` | Network reference number |
+| `acquirerCountryCode` | `"840"` | ISO 3166-1 numeric (840 = USA) |
+| `localTransactionDateTime` | `"2026-02-23T10:30:00"` | Current timestamp |
+
+### 7.2 SSLConfig.java
+
+**Location:** `visa-client/src/main/java/com/visa/client/config/SSLConfig.java`
+
+This class programmatically creates an `SSLContext` bean configured for mTLS. The client needs to do this in Java code because it uses `HttpURLConnection` directly (not Spring's `RestTemplate` or `WebClient`), so it must manually set the SSL socket factory.
+
+```java
+@Bean
+public SSLContext sslContext() throws Exception {
+    // 1. Load client keystore (client's TLS cert + private key)
+    KeyStore keyStore = KeyStore.getInstance("PKCS12");
+    keyStore.load(new FileInputStream(keyStorePath), keyStorePassword.toCharArray());
+    KeyManagerFactory kmf = KeyManagerFactory.getInstance("SunX509");
+    kmf.init(keyStore, keyStorePassword.toCharArray());
+
+    // 2. Load truststore (CA cert to verify the server)
+    KeyStore trustStore = KeyStore.getInstance("PKCS12");
+    trustStore.load(new FileInputStream(trustStorePath), trustStorePassword.toCharArray());
+    TrustManagerFactory tmf = TrustManagerFactory.getInstance(
+            TrustManagerFactory.getDefaultAlgorithm());
+    tmf.init(trustStore);
+
+    // 3. Create SSLContext combining both
+    SSLContext sslContext = SSLContext.getInstance("TLS");
+    sslContext.init(kmf.getKeyManagers(), tmf.getTrustManagers(), null);
+    return sslContext;
+}
+```
+
+- **`KeyManagerFactory`**: Holds the client's identity (certificate + private key). When the server sends a `CertificateRequest`, the `KeyManager` selects and presents the client certificate.
+- **`TrustManagerFactory`**: Holds what the client trusts. The `TrustManager` validates the server's certificate against the CA cert in the truststore.
+- **`SSLContext`**: Combines both. When injected into `VisaApiService`, it is used to set the `SSLSocketFactory` on every `HttpURLConnection`.
+
+### 7.3 MLEService.java (Client)
+
+**Location:** `visa-client/src/main/java/com/visa/client/service/MLEService.java`
+
+Mirror image of the server's `MLEService` but with **reversed key assignments**:
+
+| Method | Server version | Client version |
+|--------|---------------|----------------|
+| `encryptPayload()` | Encrypts with **client's** public key | Encrypts with **server's** public key |
+| `decryptPayload()` | Decrypts with **server's** private key | Decrypts with **client's** private key |
+
+Keys loaded at startup (`@PostConstruct`):
+- `mle-server-public.pem` → `RSAPublicKey` (encrypt outgoing requests)
+- `mle-client-private.pem` → `PrivateKey` (decrypt incoming responses)
+
+The JWE header built by the client includes `keyId` — a UUID the server uses to identify which key pair was used. This supports key rotation: the server can maintain multiple key pairs and route decryption to the correct one based on `kid`.
+
+### 7.4 VisaApiService.java
+
+**Location:** `visa-client/src/main/java/com/visa/client/service/VisaApiService.java`
+
+This is the core HTTP client. It mirrors the original Visa `PushFundsAndQueryAPIWithMLE` sample code.
+
+Dependencies injected:
+- `SSLContext sslContext` — from `SSLConfig`, provides mTLS
+- `MLEService mleService` — JWE encryption/decryption
+- `ObjectMapper objectMapper` — JSON serialization
+
+**`pushFunds(String pushFundsPayload)`**
+
+```java
+public Map<String, Object> pushFunds(String pushFundsPayload) throws Exception {
+    // Step 1: MLE-encrypt the request
+    String encryptedPayload = mleService.encryptPayload(pushFundsPayload);
+    String requestBody = objectMapper.writeValueAsString(new EncryptedPayload(encryptedPayload));
+
+    // Step 2: HTTP POST over mTLS
+    String encryptedResponseStr = invokeAPI(
+            "/visadirect/fundstransfer/v1/pushfundstransactions",
+            "POST",
+            requestBody
+    );
+
+    // Step 3: MLE-decrypt the response
+    EncryptedPayload encryptedResponse = objectMapper.readValue(
+            encryptedResponseStr, EncryptedPayload.class);
+    String decryptedResponse = mleService.decryptPayload(encryptedResponse.getEncData());
+    return objectMapper.readValue(decryptedResponse, new TypeReference<>() {});
+}
+```
+
+**`queryTransaction(String acquiringBin, String transactionIdentifier)`**
+
+```java
+public Map<String, Object> queryTransaction(
+        String acquiringBin, String transactionIdentifier) throws Exception {
+    String queryParams = "acquiringBIN=" + acquiringBin +
+            "&transactionIdentifier=" + transactionIdentifier;
+
+    // GET request — no request body, no MLE encryption on the way out
+    String encryptedResponseStr = invokeAPI(
+            "/visadirect/v1/transactionquery?" + queryParams,
+            "GET",
+            null
+    );
+
+    // MLE-decrypt the response
+    EncryptedPayload encryptedResponse = objectMapper.readValue(
+            encryptedResponseStr, EncryptedPayload.class);
+    String decryptedResponse = mleService.decryptPayload(encryptedResponse.getEncData());
+    return objectMapper.readValue(decryptedResponse, new TypeReference<>() {});
+}
+```
+
+**`invokeAPI(String resourcePath, String httpMethod, String payload)`**
+
+```java
+private String invokeAPI(String resourcePath, String httpMethod, String payload)
+        throws Exception {
+    String url = visaBaseUrl + resourcePath;                      // https://localhost:8443/...
+    HttpURLConnection con = (HttpURLConnection) new URL(url).openConnection();
+
+    // Apply mTLS — set the SSLSocketFactory from our configured SSLContext
+    if (con instanceof HttpsURLConnection httpsConn) {
+        httpsConn.setSSLSocketFactory(sslContext.getSocketFactory());
+    }
+
+    con.setRequestMethod(httpMethod);
+    con.setRequestProperty("Content-Type", "application/json");
+    con.setRequestProperty("Accept", "application/json");
+    con.setRequestProperty("keyId", mleService.getKeyId());        // MLE key identifier
+
+    // Basic Auth
+    byte[] encodedAuth = Base64.getEncoder().encode(
+            (userId + ":" + password).getBytes(StandardCharsets.UTF_8));
+    con.setRequestProperty("Authorization", "Basic " + new String(encodedAuth));
+
+    // Send body (POST only)
+    if (payload != null && !payload.isBlank()) {
+        con.setDoOutput(true);
+        con.setDoInput(true);
+        try (OutputStream os = con.getOutputStream()) {
+            os.write(payload.getBytes(StandardCharsets.UTF_8));
+        }
+    }
+
+    // Read response
+    int status = con.getResponseCode();
+    BufferedReader reader = (status == 200)
+            ? new BufferedReader(new InputStreamReader(con.getInputStream()))
+            : new BufferedReader(new InputStreamReader(con.getErrorStream()));
+
+    StringBuilder content = new StringBuilder();
+    String line;
+    while ((line = reader.readLine()) != null) { content.append(line); }
+    reader.close();
+    con.disconnect();
+    return content.toString();
+}
+```
+
+The pattern `if (con instanceof HttpsURLConnection httpsConn)` is Java 16+ pattern matching instanceof. It safely casts and checks in a single expression.
+
+---
+
+## 8. End-to-End Request Lifecycle
+
+### Push Funds Transaction (Full Flow)
+
+```
+CLIENT                                                    SERVER
+   │                                                         │
+   │  1. Build plain JSON payload (Map → ObjectMapper)       │
+   │                                                         │
+   │  2. MLEService.encryptPayload(plainJson)                │
+   │     ● Generate random 128-bit AES-GCM CEK              │
+   │     ● Encrypt CEK with server's RSA public key          │
+   │       (RSA-OAEP-256)                                    │
+   │     ● Encrypt payload with CEK (AES-128-GCM)            │
+   │     ● Produce 5-part JWE compact serialization:         │
+   │       header.encKey.iv.ciphertext.tag                   │
+   │     ● Return JWE token string                           │
+   │                                                         │
+   │  3. Wrap in JSON: {"encData": "<JWE>"}                  │
+   │                                                         │
+   │  4. invokeAPI() — open HTTPS connection                 │
+   │     a. new URL("https://localhost:8443/...").            │
+   │        openConnection()                                 │
+   │     b. httpsConn.setSSLSocketFactory(                   │
+   │          sslContext.getSocketFactory())                 │
+   │                                                         │
+   │  ════════ TLS HANDSHAKE ════════════════════════════    │
+   │  ClientHello ──────────────────────────────────────►   │
+   │  ◄── ServerHello + Server Certificate ─────────────    │
+   │  ◄── CertificateRequest ────────────────────────────   │
+   │  Client Certificate ───────────────────────────────►   │
+   │  CertificateVerify ────────────────────────────────►   │
+   │  ◄═════════════ Encrypted TLS channel ═════════════►   │
+   │  ════════ HANDSHAKE COMPLETE ═══════════════════════   │
+   │                                                         │
+   │  5. Send HTTP POST over TLS:                            │
+   │     Headers:                                            │
+   │       Authorization: Basic <base64(userId:password)>    │
+   │       Content-Type: application/json                    │
+   │       keyId: 7f591161-6b5f-4136-80b8-2ae8a44ad9eb      │
+   │     Body:                                               │
+   │       {"encData":"eyJlbmMiOiJBMTI4R0NNIJ..."}          │
+   │ ──────────────────────────────────────────────────────► │
+   │                                                         │
+   │                           6. Spring Security filters:   │
+   │                              ● Decode Authorization     │
+   │                                header (base64)          │
+   │                              ● BCrypt-verify password   │
+   │                              ● Reject if invalid        │
+   │                                                         │
+   │                           7. FundsTransferController    │
+   │                              .pushFunds() is called     │
+   │                                                         │
+   │                           8. MLEService.decryptPayload()│
+   │                              ● JWEObject.parse(token)   │
+   │                              ● Decrypt CEK with         │
+   │                                server's RSA private key │
+   │                              ● Decrypt payload with CEK │
+   │                              ● Return plain JSON        │
+   │                                                         │
+   │                           9. processTransaction():      │
+   │                              ● actionCode = "00"        │
+   │                              ● Generate approvalCode    │
+   │                              ● Mask PAN                 │
+   │                              ● Store in TransactionStore│
+   │                              ● Build response Map       │
+   │                                                         │
+   │                           10. MLEService.encryptPayload()
+   │                               ● Encrypt response JSON   │
+   │                               ● Using client's public   │
+   │                                 MLE cert                │
+   │                               ● Return JWE token        │
+   │                                                         │
+   │                           11. Return HTTP 200:          │
+   │                               {"encData":"<JWE>"}       │
+   │ ◄────────────────────────────────────────────────────── │
+   │                                                         │
+   │  12. MLEService.decryptPayload(responseJWE)             │
+   │      ● Decrypt with client's MLE private key            │
+   │      ● Return plain JSON response                       │
+   │                                                         │
+   │  13. Parse and print:                                   │
+   │      Transaction ID:  381228649430015                   │
+   │      Action Code:     00                                │
+   │      Approval Code:   718777                            │
+   │      Amount:          124.05                            │
+   │      Recipient PAN:   4957****0496                      │
+```
+
+### Transaction Query (Full Flow)
+
+```
+CLIENT                                                    SERVER
+   │                                                         │
+   │  1. Build query URL:                                    │
+   │     /visadirect/v1/transactionquery?                    │
+   │     acquiringBIN=408999&                                │
+   │     transactionIdentifier=381228649430015               │
+   │                                                         │
+   │  2. invokeAPI() — GET, no body, no MLE encryption       │
+   │     (GET requests have no body to encrypt)              │
+   │                                                         │
+   │  3. Send HTTP GET over established TLS:                 │
+   │     Headers:                                            │
+   │       Authorization: Basic <base64(userId:password)>    │
+   │       keyId: 7f591161-6b5f-4136-80b8-2ae8a44ad9eb      │
+   │ ──────────────────────────────────────────────────────► │
+   │                                                         │
+   │                           4. Spring Security auth check │
+   │                                                         │
+   │                           5. FundsTransferController    │
+   │                              .queryTransaction()        │
+   │                                                         │
+   │                           6. TransactionStore           │
+   │                              .findByIdentifierAndBin()  │
+   │                              ● Look up by txn ID        │
+   │                              ● Verify acquiringBin      │
+   │                                matches stored value     │
+   │                                                         │
+   │                           7. Build response:            │
+   │                              statusIdentifier:COMPLETED │
+   │                              transactionIdentifier: ... │
+   │                              actionCode: 00             │
+   │                              originalAmount: 124.05     │
+   │                                                         │
+   │                           8. MLEService.encryptPayload()│
+   │                              using client's public cert │
+   │                                                         │
+   │                           9. Return HTTP 200:           │
+   │                              {"encData":"<JWE>"}        │
+   │ ◄────────────────────────────────────────────────────── │
+   │                                                         │
+   │  10. MLEService.decryptPayload()                        │
+   │      ● Decrypt with client's MLE private key            │
+   │                                                         │
+   │  11. Print:                                             │
+   │      Status:          COMPLETED                         │
+   │      Transaction ID:  381228649430015                   │
+   │      Action Code:     00                                │
+   │      Original Amount: 124.05                            │
+```
+
+---
+
+## 9. API Reference
+
+### Base URL
+
+```
+https://localhost:8443
+```
+
+### Authentication (all endpoints)
+
+| Header | Value | Required |
+|--------|-------|----------|
+| `Authorization` | `Basic base64(userId:password)` | Yes |
+| `keyId` | `7f591161-6b5f-4136-80b8-2ae8a44ad9eb` | Yes |
+| mTLS | Client certificate must be presented at TLS layer | Yes |
+
+### POST /visadirect/fundstransfer/v1/pushfundstransactions
+
+**Push Funds Transaction (OCT — Original Credit Transaction)**
+
+**Request body:**
+```json
+{
+  "encData": "<JWE compact serialization of the push funds JSON>"
+}
+```
+
+**Decrypted request payload example:**
+```json
+{
+  "amount": "124.05",
+  "acquiringBin": "408999",
+  "acquirerCountryCode": "840",
+  "senderName": "Mohammed Qasim",
+  "senderAddress": "901 Metro Center Blvd",
+  "senderCity": "Foster City",
+  "senderStateCode": "CA",
+  "senderCountryCode": "124",
+  "senderReference": "",
+  "senderAccountNumber": "4653459515756154",
+  "recipientName": "rohan",
+  "recipientPrimaryAccountNumber": "4957030420210496",
+  "transactionIdentifier": "381228649430015",
+  "retrievalReferenceNumber": "412770451018",
+  "systemsTraceAuditNumber": "451018",
+  "localTransactionDateTime": "2026-02-23T10:30:00",
+  "businessApplicationId": "AA",
+  "settlementServiceIndicator": "9",
+  "merchantCategoryCode": "6012",
+  "transactionCurrencyCode": "USD",
+  "sourceOfFundsCode": "05",
+  "pointOfServiceData": {
+    "panEntryMode": "90",
+    "posConditionCode": "00",
+    "motoECIIndicator": "0"
+  },
+  "cardAcceptor": {
+    "name": "Visa Inc. USA-Foster City",
+    "idCode": "CA-IDCode-77765",
+    "terminalId": "TID-9999",
+    "address": {
+      "country": "USA",
+      "zipCode": "94404",
+      "county": "San Mateo",
+      "state": "CA"
+    }
+  },
+  "colombiaNationalServiceData": {
+    "addValueTaxReturn": "10.00",
+    "taxAmountConsumption": "10.00",
+    "nationalNetReimbursementFeeBaseAmount": "20.00",
+    "addValueTaxAmount": "10.00",
+    "nationalNetMiscAmount": "10.00",
+    "countryCodeNationalService": "170",
+    "nationalChargebackReason": "11",
+    "emvTransactionIndicator": "1",
+    "nationalNetMiscAmountType": "A",
+    "costTransactionIndicator": "0",
+    "nationalReimbursementFee": "20.00"
+  }
+}
+```
+
+**Response body:**
+```json
+{
+  "encData": "<JWE compact serialization of the response JSON>"
+}
+```
+
+**Decrypted response payload:**
+```json
+{
+  "transactionIdentifier": "381228649430015",
+  "actionCode": "00",
+  "approvalCode": "718777",
+  "responseCode": "5",
+  "transmissionDateTime": "2026-02-23T10:30:01",
+  "amount": "124.05",
+  "recipientPrimaryAccountNumber": "4957****0496",
+  "senderName": "Mohammed Qasim",
+  "recipientName": "rohan",
+  "merchantCategoryCode": "6012",
+  "acquiringBin": "408999",
+  "feeProgramIndicator": "123"
+}
+```
+
+**Action codes:**
+- `00` = Approved and completed
+
+---
+
+### GET /visadirect/v1/transactionquery
+
+**Transaction Query**
+
+**Query parameters:**
+
+| Parameter | Example | Description |
+|-----------|---------|-------------|
+| `acquiringBIN` | `408999` | Acquiring Bank Identification Number |
+| `transactionIdentifier` | `381228649430015` | Transaction ID from push funds response |
+
+**Full URL example:**
+```
+GET https://localhost:8443/visadirect/v1/transactionquery?acquiringBIN=408999&transactionIdentifier=381228649430015
+```
+
+**Response body (same MLE envelope):**
+```json
+{
+  "encData": "<JWE compact serialization>"
+}
+```
+
+**Decrypted response — transaction found:**
+```json
+{
+  "statusIdentifier": "COMPLETED",
+  "transactionIdentifier": "381228649430015",
+  "acquiringBin": "408999",
+  "actionCode": "00",
+  "approvalCode": "718777",
+  "responseCode": "5",
+  "transmissionDateTime": "2026-02-23T10:30:01",
+  "originalAmount": "124.05",
+  "recipientPrimaryAccountNumber": "4957****0496"
+}
+```
+
+**Decrypted response — transaction not found:**
+```json
+{
+  "statusIdentifier": "NOT_FOUND",
+  "transactionIdentifier": "381228649430015",
+  "acquiringBin": "408999",
+  "errorMessage": "Transaction not found"
+}
+```
+
+---
+
+## 10. Configuration Reference
+
+### Server: `visa-server/src/main/resources/application.yml`
+
+```yaml
+server:
+  port: 8443                              # HTTPS port (the Visa API standard)
+  ssl:
+    enabled: true
+    key-store: file:C:/Users/Vignesh/visa-projects/certs/server-keystore.p12
+    key-store-password: changeit          # PKCS12 keystore password
+    key-store-type: PKCS12
+    key-alias: server                     # Alias inside the keystore
+    client-auth: need                     # REQUIRE client certificate (enforces mTLS)
+    trust-store: file:C:/Users/Vignesh/visa-projects/certs/server-truststore.p12
+    trust-store-password: changeit
+    trust-store-type: PKCS12
+    protocol: TLS                         # Use TLS (not SSL)
+    enabled-protocols: TLSv1.2,TLSv1.3   # Disallow TLS 1.0 and 1.1
+
+spring:
+  application:
+    name: visa-server
+
+visa:
+  auth:
+    user-id: "1WM2TT4IHPXC8DQ5I3CH21n1rEBGK-Eyv_oLdzE2VZpDqRn_U"
+    password: "19JRVdej9"
+
+mle:
+  key-id: "7f591161-6b5f-4136-80b8-2ae8a44ad9eb"
+  server-private-key-path: C:/Users/Vignesh/visa-projects/certs/mle-server-private.pem
+  client-public-cert-path: C:/Users/Vignesh/visa-projects/certs/mle-client-public.pem
+
+logging:
+  level:
+    com.visa.server: DEBUG
+```
+
+**Key: `client-auth: need`**
+
+This is the single most important server config for mTLS. The three options are:
+- `none` — server does not request client cert (standard TLS)
+- `want` — server requests client cert but accepts connections without one
+- `need` — server rejects any connection that does not provide a valid client cert
+
+**Key: `key-alias: server`**
+
+When the PKCS12 keystore contains multiple certificates, this alias identifies which certificate to use as the server's TLS identity. Set by the `-name server` flag during `openssl pkcs12 -export ...`.
+
+**Key: `file:` prefix**
+
+The `file:` prefix in `key-store: file:C:/...` tells Spring Boot the path is a filesystem path (not a classpath resource). Without `file:`, Spring Boot would search the classpath.
+
+---
+
+### Client: `visa-client/src/main/resources/application.yml`
+
+```yaml
+server:
+  port: 8080                              # Client's own HTTP port (unused in demo)
+
+spring:
+  application:
+    name: visa-client
+
+visa:
+  base-url: "https://localhost:8443"      # Server URL
+  auth:
+    user-id: "1WM2TT4IHPXC8DQ5I3CH21n1rEBGK-Eyv_oLdzE2VZpDqRn_U"
+    password: "19JRVdej9"
+
+ssl:
+  key-store: C:/Users/Vignesh/visa-projects/certs/client-keystore.p12
+  key-store-password: changeit
+  key-store-type: PKCS12
+  trust-store: C:/Users/Vignesh/visa-projects/certs/client-truststore.p12
+  trust-store-password: changeit
+  trust-store-type: PKCS12
+
+mle:
+  key-id: "7f591161-6b5f-4136-80b8-2ae8a44ad9eb"
+  server-public-cert-path: C:/Users/Vignesh/visa-projects/certs/mle-server-public.pem
+  client-private-key-path: C:/Users/Vignesh/visa-projects/certs/mle-client-private.pem
+
+logging:
+  level:
+    com.visa.client: DEBUG
+```
+
+Note: The client's SSL config does **not** use the `file:` prefix and has a custom `ssl.*` namespace (not `server.ssl.*`). This is because the client configures SSL programmatically in `SSLConfig.java` using `@Value("${ssl.key-store}")` — it is not using Spring Boot's auto-configured SSL.
+
+---
+
+### Configuration Properties Mapping
+
+| Property | Injected Into | Java Field |
+|----------|--------------|-----------|
+| `ssl.key-store` | `SSLConfig` | `keyStorePath` |
+| `ssl.key-store-password` | `SSLConfig` | `keyStorePassword` |
+| `ssl.key-store-type` | `SSLConfig` | `keyStoreType` |
+| `ssl.trust-store` | `SSLConfig` | `trustStorePath` |
+| `ssl.trust-store-password` | `SSLConfig` | `trustStorePassword` |
+| `ssl.trust-store-type` | `SSLConfig` | `trustStoreType` |
+| `mle.key-id` | `MLEService` (client) | `keyId` |
+| `mle.server-public-cert-path` | `MLEService` (client) | `serverPublicCertPath` |
+| `mle.client-private-key-path` | `MLEService` (client) | `clientPrivateKeyPath` |
+| `visa.base-url` | `VisaApiService` | `visaBaseUrl` |
+| `visa.auth.user-id` | `VisaApiService`, `SecurityConfig` | `userId` |
+| `visa.auth.password` | `VisaApiService`, `SecurityConfig` | `password` |
+
+---
+
+## 11. Installation and Setup
+
+### Prerequisites
+
+| Requirement | Version | How to Verify |
+|-------------|---------|--------------|
+| Java JDK | 17 or higher | `java -version` |
+| Maven | 3.6 or higher | `mvn -version` |
+| OpenSSL | Any modern version | `openssl version` |
+| Git Bash (Windows) | Any | Required to run `generate-certs.sh` |
+
+On Windows, OpenSSL is bundled with Git for Windows at `C:\Program Files\Git\usr\bin\openssl.exe`. Git Bash adds it to the PATH automatically.
+
+`keytool` ships with the JDK and is available wherever Java is installed.
+
+---
+
+### Step 1: Clone / Navigate to the Project
+
+```bash
+cd C:/Users/Vignesh/visa-projects
+```
+
+---
+
+### Step 2: Generate All Certificates
+
+Open **Git Bash** (not PowerShell or CMD) and run:
+
+```bash
+cd certs
+bash generate-certs.sh
+```
+
+Expected output:
+```
+============================================================
+  Generating Certificates for mTLS + MLE
+============================================================
+
+[1/8] Generating CA key and self-signed certificate...
+[2/8] Generating Server TLS key and certificate...
+  -> server-keystore.p12 created
+[3/8] Generating Client TLS key and certificate...
+  -> client-keystore.p12 created
+[4/8] Creating Server truststore...
+  -> server-truststore.p12 created
+[5/8] Creating Client truststore...
+  -> client-truststore.p12 created
+[6/8] Generating MLE Server RSA key pair...
+  -> mle-server-private.pem (server keeps this secret)
+  -> mle-server-public.pem  (shared with client)
+[7/8] Generating MLE Client RSA key pair...
+  -> mle-client-private.pem (client keeps this secret)
+  -> mle-client-public.pem  (shared with server)
+[8/8] Cleaning up temporary files...
+
+============================================================
+  Certificate Generation Complete!
+============================================================
+```
+
+After this step, verify the `certs/` directory contains:
+
+```
+ca.crt
+server-keystore.p12
+server-truststore.p12
+server-tls.crt
+client-keystore.p12
+client-truststore.p12
+client-tls.crt
+mle-server-private.pem
+mle-server-public.pem
+mle-client-private.pem
+mle-client-public.pem
+generate-certs.sh
+CERTIFICATES.md
+```
+
+---
+
+### Step 3: Verify Certificate Paths in application.yml
+
+The paths in both `application.yml` files are already set to `C:/Users/Vignesh/visa-projects/certs/`. If you have the project in a different directory, update these paths.
+
+**Server** (`visa-server/src/main/resources/application.yml`):
+```yaml
+server:
+  ssl:
+    key-store: file:C:/Users/Vignesh/visa-projects/certs/server-keystore.p12
+    trust-store: file:C:/Users/Vignesh/visa-projects/certs/server-truststore.p12
+mle:
+  server-private-key-path: C:/Users/Vignesh/visa-projects/certs/mle-server-private.pem
+  client-public-cert-path: C:/Users/Vignesh/visa-projects/certs/mle-client-public.pem
+```
+
+**Client** (`visa-client/src/main/resources/application.yml`):
+```yaml
+ssl:
+  key-store: C:/Users/Vignesh/visa-projects/certs/client-keystore.p12
+  trust-store: C:/Users/Vignesh/visa-projects/certs/client-truststore.p12
+mle:
+  server-public-cert-path: C:/Users/Vignesh/visa-projects/certs/mle-server-public.pem
+  client-private-key-path: C:/Users/Vignesh/visa-projects/certs/mle-client-private.pem
+```
+
+---
+
+### Step 4: Build Both Projects (optional pre-check)
+
+```bash
+cd C:/Users/Vignesh/visa-projects/visa-server
+mvn clean package -DskipTests
+
+cd C:/Users/Vignesh/visa-projects/visa-client
+mvn clean package -DskipTests
+```
+
+---
+
+## 12. Running the System
+
+### Start the Server (Terminal 1)
+
+```bash
+cd C:/Users/Vignesh/visa-projects/visa-server
+mvn spring-boot:run
+```
+
+Wait until you see the startup banner:
+```
+##########################################################
+  Visa Server started on https://localhost:8443
+  mTLS: ENABLED (client certificate required)
+  MLE:  ENABLED (JWE RSA-OAEP-256 / A128GCM)
+##########################################################
+```
+
+The server is now listening on `https://localhost:8443` with mTLS enforced.
+
+### Run the Client (Terminal 2)
+
+```bash
+cd C:/Users/Vignesh/visa-projects/visa-client
+mvn spring-boot:run
+```
+
+The client will:
+1. Start Spring Boot
+2. Load the mTLS `SSLContext` from `SSLConfig`
+3. Load MLE keys from `MLEService` (`@PostConstruct`)
+4. Execute `CommandLineRunner` — push funds then query
+5. Print results
+6. Exit (Spring Boot `CommandLineRunner` apps exit after `run()` completes)
+
+---
+
+## 13. Expected Output
+
+### Server Logs (what you see in Terminal 1 while client runs)
+
+```
+=== Push Funds Transaction (OCT) ===
+Received MLE-encrypted request with keyId: 7f591161-6b5f-4136-80b8-2ae8a44ad9eb
+Encrypted request (JWE): eyJlbmMiOiJBMTI4R0NNIiwiYWxnIjoiUlNBLU9BRVAtMjU2IiwiaWF0IjoxNzcxNTE4NjgwMjE0LCJraWQiOiI3ZjU5MTE2...
+Decrypted request payload: {"amount":"124.05","senderAddress":"901 Metro Center Blvd",...}
+Response payload: {"transactionIdentifier":"381228649430015","actionCode":"00",...}
+Response encrypted successfully
+Transaction stored: 381228649430015
+
+=== Transaction Query ===
+Query: acquiringBIN=408999, transactionIdentifier=381228649430015
+Query response payload: {"statusIdentifier":"COMPLETED","transactionIdentifier":"381228649430015",...}
+```
+
+### Client Output (what you see in Terminal 2)
+
+```
+##########################################################
+  Visa Client - mTLS + MLE Demo
+##########################################################
+
+##########################################################
+START: Push Funds Transaction (OCT) with MLE + mTLS
+##########################################################
+
+OCT Response:
+  Transaction ID:  381228649430015
+  Action Code:     00
+  Approval Code:   718777
+  Amount:          124.05
+  Recipient PAN:   4957****0496
+
+END: Push Funds Transaction (OCT) with MLE + mTLS
+##########################################################
+
+##########################################################
+START: Transaction Query with MLE + mTLS
+##########################################################
+
+Query Response:
+  Status:          COMPLETED
+  Transaction ID:  381228649430015
+  Action Code:     00
+  Approval Code:   718777
+  Original Amount: 124.05
+
+END: Transaction Query with MLE + mTLS
+##########################################################
+
+##########################################################
+  ALL TESTS PASSED - mTLS + MLE working correctly!
+##########################################################
+```
+
+---
+
+## 14. How the JWE Token is Structured
+
+A JWE compact serialization has exactly **5 parts** separated by dots (`.`):
+
+```
+BASE64URL(Header) . BASE64URL(Encrypted_Key) . BASE64URL(IV) . BASE64URL(Ciphertext) . BASE64URL(Auth_Tag)
+```
+
+Example (abbreviated):
+```
+eyJlbmMiOiJBMTI4R0NNIiwiYWxnIjoiUlNBLU9BRVAtMjU2IiwiaWF0IjoxNzcx...
+.
+bG9uZ0Jhc2U2NFVSTEVuY3J5cHRlZEtleUhlcmU...
+.
+aXZJbml0VmVjdG9y...
+.
+Y2lwaGVydGV4dEdvZXNIZXJl...
+.
+YXV0aFRhZ0hlcmU...
+```
+
+**Part 1 — Header (Base64URL-encoded JSON):**
+
+Decoded:
+```json
+{
+  "enc": "A128GCM",
+  "alg": "RSA-OAEP-256",
+  "iat": 1771518680214,
+  "kid": "7f591161-6b5f-4136-80b8-2ae8a44ad9eb"
+}
+```
+
+**Part 2 — Encrypted Key:**
+
+The 128-bit AES-GCM Content Encryption Key (CEK), encrypted with the recipient's RSA public key using RSA-OAEP-256. Only the holder of the matching RSA private key can recover the CEK.
+
+**Part 3 — Initialization Vector (IV):**
+
+Random 96-bit nonce for AES-GCM. Unique per JWE token. AES-GCM requires a unique IV for every encryption with the same key.
+
+**Part 4 — Ciphertext:**
+
+The actual JSON payload, encrypted with AES-128-GCM using the CEK and IV.
+
+**Part 5 — Authentication Tag:**
+
+A 128-bit GCM tag. Verifies that neither the ciphertext nor the header was tampered with. Decryption fails if this tag is invalid.
+
+---
+
+## 15. Key Concepts Explained
+
+### What is mTLS and Why Use It?
+
+Standard TLS only proves the server's identity to the client. Anyone with an internet connection can call a TLS-secured API — the server does not know who the client is at the transport level.
+
+mTLS adds **client certificate authentication** at the TLS layer. The server refuses the TLS handshake entirely if the client cannot present a certificate signed by a trusted CA. This provides:
+
+- **Machine-level authentication** — not just user-level credentials
+- **Protection before any HTTP data is sent** — even malformed requests are dropped at the TLS layer
+- **Non-repudiation** — the client's cryptographic signature proves it holds the private key
+
+### What is MLE and Why Use It on Top of TLS?
+
+TLS encrypts the transport channel end-to-end between client and server. However in enterprise and payment environments there are scenarios where TLS alone is insufficient:
+
+1. **TLS termination proxies**: Load balancers, API gateways, and WAFs often terminate TLS and re-encrypt before forwarding to the application. The payload is briefly decrypted at the proxy. With MLE, the proxy sees only the encrypted `encData` — the actual payment data remains encrypted through every hop.
+
+2. **Logging systems**: Application servers, proxies, and monitoring tools frequently log HTTP request and response bodies. Without MLE, these logs would contain PAN numbers and transaction amounts. With MLE, logs contain only the opaque JWE token.
+
+3. **Defense in depth**: If a vulnerability is found in the TLS implementation, MLE provides an additional barrier.
+
+### RSA-OAEP-256 vs Plain RSA
+
+Plain RSA encryption (PKCS#1 v1.5) is deterministic and has known vulnerabilities (Bleichenbacher attack). RSA-OAEP (Optimal Asymmetric Encryption Padding) adds randomness and prevents these attacks. The `-256` suffix means SHA-256 is used as the hash function in the OAEP construction.
+
+### AES-GCM Authenticated Encryption
+
+AES-GCM (Galois/Counter Mode) provides both confidentiality **and** integrity:
+- **Confidentiality**: AES stream cipher encrypts the data
+- **Integrity**: GCM's authentication tag detects any tampering with the ciphertext
+
+If someone alters even one bit of the encrypted payload, the `decrypt()` call will throw an exception rather than returning corrupted data. This is called Authenticated Encryption with Associated Data (AEAD).
+
+### PKCS#1 vs PKCS#8 Key Formats
+
+Both formats store RSA private keys but differ in structure and PEM header:
+
+| Aspect | PKCS#1 | PKCS#8 |
+|--------|--------|--------|
+| Header | `-----BEGIN RSA PRIVATE KEY-----` | `-----BEGIN PRIVATE KEY-----` |
+| Structure | RSA-specific ASN.1 structure | Algorithm-agnostic wrapper |
+| Parsing in Java | Via BouncyCastle `ASN1Sequence` | Via `PKCS8EncodedKeySpec` |
+| OpenSSL command | `openssl rsa -traditional` | Default in OpenSSL 3.x |
+| Visa standard | Yes (used by Visa sample code) | Fallback supported |
+
+The code supports both formats by checking the PEM header:
+```java
+if (pemContent.contains("-----BEGIN RSA PRIVATE KEY-----")) {
+    // PKCS#1: parse via BouncyCastle ASN1
+} else {
+    // PKCS#8: parse via PKCS8EncodedKeySpec
+}
+```
+
+### Why `ConcurrentHashMap` for TransactionStore
+
+Tomcat processes HTTP requests on a thread pool (by default, up to 200 threads). Multiple requests can execute `FundsTransferController` methods simultaneously. A regular `HashMap` is not thread-safe and can cause data corruption or `ConcurrentModificationException` under concurrent access. `ConcurrentHashMap` provides thread-safe reads and writes with minimal locking overhead.
+
+---
+
+## 16. Troubleshooting Guide
+
+### Error: `PKIX path building failed` / `unable to find valid certification path`
+
+**Cause:** The truststore does not contain the CA that signed the other side's certificate.
+
+**Fix:** Verify the truststore contents:
+```bash
+keytool -list -v -keystore certs/client-truststore.p12 -storetype PKCS12 -storepass changeit
+```
+Should show an entry with `Alias name: ca`. If not, regenerate:
+```bash
+bash certs/generate-certs.sh
+```
+
+---
+
+### Error: `Received fatal alert: bad_certificate`
+
+**Cause:** The server is requiring a client certificate (mTLS) but the client is not presenting one, or the client's certificate was not signed by the CA in the server's truststore.
+
+**Fix:** Verify the client keystore contains a valid certificate:
+```bash
+keytool -list -v -keystore certs/client-keystore.p12 -storetype PKCS12 -storepass changeit
+```
+Should show an entry with `Alias name: client`.
+
+---
+
+### Error: `No subject alternative names matching IP address 127.0.0.1 found`
+
+**Cause:** The server certificate does not include `127.0.0.1` in its Subject Alternative Names, but the client is connecting to `127.0.0.1` instead of `localhost`.
+
+**Fix:** Verify the server cert has the SAN:
+```bash
+openssl x509 -in certs/server-tls.crt -text -noout | grep -A2 "Subject Alternative Name"
+```
+Should show: `DNS:localhost, IP Address:127.0.0.1`
+
+If not, regenerate certificates. Also ensure `visa.base-url` in client config uses `localhost` not `127.0.0.1`.
+
+---
+
+### Error: `Illegal base64 character 2d` during MLE key loading
+
+**Cause:** The private key PEM file has `-----BEGIN RSA PRIVATE KEY-----` but the base64-strip code was also trying to strip `-----BEGIN PRIVATE KEY-----`, or vice versa. Or the PEM has Windows-style CRLF line endings causing issues.
+
+**Fix:** Regenerate certificates. The script outputs keys in PKCS#1 format (`-----BEGIN RSA PRIVATE KEY-----`) via `openssl rsa -traditional`. The code handles both formats.
+
+---
+
+### Error: `password was incorrect` or `Keystore was tampered with or password was incorrect`
+
+**Cause:** Wrong password for keystore or truststore. All files use password `changeit`.
+
+**Fix:** Verify in `application.yml`:
+```yaml
+ssl:
+  key-store-password: changeit
+  trust-store-password: changeit
+```
+
+---
+
+### Error: `Connection refused: connect` or `ConnectException`
+
+**Cause:** The server is not running when the client tries to connect.
+
+**Fix:** Start the server first (Terminal 1), wait for the startup banner, then run the client (Terminal 2).
+
+---
+
+### Error: `401 Unauthorized`
+
+**Cause:** The Basic Auth credentials in the client's `application.yml` do not match the server's configured credentials.
+
+**Fix:** Both files must have the same `visa.auth.user-id` and `visa.auth.password` values:
+
+Server (`visa-server/src/main/resources/application.yml`):
+```yaml
+visa:
+  auth:
+    user-id: "1WM2TT4IHPXC8DQ5I3CH21n1rEBGK-Eyv_oLdzE2VZpDqRn_U"
+    password: "19JRVdej9"
+```
+
+Client (`visa-client/src/main/resources/application.yml`):
+```yaml
+visa:
+  auth:
+    user-id: "1WM2TT4IHPXC8DQ5I3CH21n1rEBGK-Eyv_oLdzE2VZpDqRn_U"
+    password: "19JRVdej9"
+```
+
+---
+
+### Error: `JWE decryption failed` or `JOSEException`
+
+**Cause:** The JWE was encrypted with the wrong public key, or the private key used for decryption does not match the public key used for encryption.
+
+**Fix:** Verify the MLE public/private key pairs match:
+```bash
+# These should output the same modulus value
+openssl rsa -in certs/mle-server-private.pem -modulus -noout
+openssl x509 -in certs/mle-server-public.pem -modulus -noout
+
+openssl rsa -in certs/mle-client-private.pem -modulus -noout
+openssl x509 -in certs/mle-client-public.pem -modulus -noout
+```
+
+If they differ, regenerate certificates.
+
+---
+
+### Git Bash converts `/C=US` to a Windows path in `generate-certs.sh`
+
+**Cause:** Git Bash on Windows converts POSIX-style paths beginning with `/` to Windows paths. The OpenSSL `-subj` argument `/C=US/ST=California/...` starts with `/C` which Git Bash interprets as a drive letter.
+
+**Fix:** The script already sets `MSYS_NO_PATHCONV=1` at the top to prevent this. If running OpenSSL commands manually, prefix them:
+```bash
+MSYS_NO_PATHCONV=1 openssl req -new -x509 ... -subj "/C=US/..."
+```
+
+---
+
+### Verifying the Full mTLS Setup with OpenSSL
+
+While the server is running, test the TLS connection directly:
+
+```bash
+# From the certs/ directory
+openssl s_client -connect localhost:8443 \
+  -cert client-tls.crt \
+  -key client-tls.key \    # Note: client-tls.key was deleted by cleanup. Extract it first or use keystore.
+  -CAfile ca.crt
+```
+
+A successful mTLS connection shows:
+```
+SSL handshake has read ... bytes and written ... bytes
+Verification: OK
+...
+Server certificate
+    subject=C=US, ST=California, L=Foster City, O=Visa Inc, OU=Server, CN=localhost
+    issuer=C=US, ST=California, L=Foster City, O=Visa Inc, OU=Visa CA, CN=Visa Local CA
+...
+SSL-Session:
+    Protocol : TLSv1.3
+    Cipher   : TLS_AES_256_GCM_SHA384
+```
+
+---
+
+## Credentials Summary
+
+| Credential | Value |
+|-----------|-------|
+| Basic Auth User ID | `1WM2TT4IHPXC8DQ5I3CH21n1rEBGK-Eyv_oLdzE2VZpDqRn_U` |
+| Basic Auth Password | `19JRVdej9` |
+| MLE Key ID (UUID) | `7f591161-6b5f-4136-80b8-2ae8a44ad9eb` |
+| Keystore/Truststore Password | `changeit` |
+| Demo Acquiring BIN | `408999` |
+| Demo Transaction ID | `381228649430015` |
+| Demo Recipient PAN | `4957030420210496` |
+| Demo Amount | `124.05 USD` |
+
+---
+
+*End of Technical Specification*
